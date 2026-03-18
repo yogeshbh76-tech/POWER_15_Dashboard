@@ -1,1 +1,1 @@
-web: python cloud_dashboard.py
+web: python Cloud_dashboard.py

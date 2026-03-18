@@ -69,7 +69,7 @@ def build():
         pnl=(p-t["entry_price"])*t["quantity"]
         pct=(p-t["entry_price"])/t["entry_price"]*100
         d=(now.replace(tzinfo=None)-datetime.strptime(t["entry_date"],"%Y-%m-%d")).days
-        lf=max(0,90-d); pk=t.get("peak_cmp",p)
+        lf=max(0,90-d); pk=t.get("peak_cmp",p) or p
         pkp=(pk-t["entry_price"])/t["entry_price"]*100
         tier=TIERS.get(t["symbol"],2); cfg=HYBRID.get(t["symbol"],{"t":80,"tr":0})
         ton=pkp>=cfg["t"] and cfg["tr"]>0

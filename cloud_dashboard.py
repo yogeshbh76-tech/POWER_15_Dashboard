@@ -56,6 +56,24 @@ def nifty():
         return p,ch
     except: return None,None
 
+
+def fetch_ma_trades():
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ma_trades?trade_date=eq.{today}&select=*&order=created_at.desc",
+            headers=HDR, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except: return []
+
+def get_ma_cmp(symbol):
+    try:
+        r = requests.get(
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}.NS?interval=15m&range=1d",
+            headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+        return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    except: return None
+
 def build():
     now=datetime.now(IST)
     trades=sup("p15_trades"); cr=sup("p15_capital")
@@ -142,6 +160,32 @@ def build():
         tick_items=" ".join([f'<span class="ti"><span class="ti-s">{t["symbol"]}</span><span id="tc_{t["symbol"]}" style="color:{"#10B981" if t["pct"]>=0 else "#EF4444"}">{t["pct"]:+.2f}%</span><span id="tp_{t["symbol"]}" style="color:{"#10B981" if t["pnl"]>=0 else "#EF4444"}">{fi(t["pnl"],True)}</span><span class="td">·</span></span>' for t in en]*6)
     else:
         tick_items='<span class="ti"><span class="ti-s">POWER 15</span><span style="color:#F59E0B">Paper Trading Active · No Open Positions</span></span>'*4
+
+
+    # MA Strategy
+    ma_all    = fetch_ma_trades()
+    ma_open   = [t for t in ma_all if t.get("status")=="OPEN"]
+    ma_closed = [t for t in ma_all if t.get("status")=="CLOSED"]
+    ma_enriched=[]; ma_total_unreal=0
+    for t in ma_open:
+        cmp2=get_ma_cmp(t["symbol"]) or t["entry_price"]
+        pnl2=(cmp2-t["entry_price"])*t["quantity"]
+        pct2=(cmp2-t["entry_price"])/t["entry_price"]*100
+        ma_total_unreal+=pnl2
+        ma_enriched.append({**t,"cmp2":cmp2,"pnl2":pnl2,"pct2":pct2})
+    ma_wins=sum(1 for t in ma_closed if (t.get("exit_price",t["entry_price"])-t["entry_price"])>0)
+    ma_total_tr=len(ma_closed)
+    ma_wr=ma_wins/ma_total_tr*100 if ma_total_tr>0 else 0
+    ma_realised=sum((t.get("exit_price",t["entry_price"])-t["entry_price"])*t["quantity"] for t in ma_closed)
+    ma_total_pnl=ma_realised+ma_total_unreal
+    run2=0; ma_equity=[]
+    for t in sorted(ma_closed,key=lambda x:x.get("exit_time","00:00")):
+        run2+=(t.get("exit_price",t["entry_price"])-t["entry_price"])*t["quantity"]
+        ma_equity.append(round(run2,2))
+    ma_eq_js=json.dumps(ma_equity if ma_equity else [0])
+    ma_td_js=json.dumps([{"sym":t["symbol"],"entry":t["entry_price"],"qty":t["quantity"],
+        "cmp":t.get("cmp2",t["entry_price"]),"pnl":round(t.get("pnl2",0),2),
+        "pct":round(t.get("pct2",0),2)} for t in ma_enriched])
 
     return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -424,6 +468,7 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
   <button class="mnav-btn" onclick="showTab('positions',this)">📊 Positions</button>
   <button class="mnav-btn" onclick="showTab('charts',this)">📈 Charts</button>
   <button class="mnav-btn" onclick="showTab('history',this)">📋 History</button>
+  <button class="mnav-btn" onclick="showTab('ma',this)">⚡ MA</button>
 </nav>
 
 <!-- TICKER -->
@@ -542,6 +587,7 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
         </table></div>
       </div>''' if cl else ''}
 
+    <!-- MA_TAB_INJECT -->
     </div>
     <div class="update-bar">
       <div class="upd-dot"></div>
@@ -580,34 +626,7 @@ function toggleTheme(){{
 }}
 (()=>{{const s=localStorage.getItem('p15t');if(s)document.documentElement.dataset.theme=s;}})();
 
-// Mobile tab switching
-function showTab(tab, btn){{
-  // update active nav
-  document.querySelectorAll('.mnav-btn').forEach(b=>b.classList.remove('active'));
-  if(btn)btn.classList.add('active');
-  
-  // show/hide sections based on tab
-  const portfolio=document.getElementById('tab-portfolio');
-  const positions=document.getElementById('tab-positions');
-  const charts=document.getElementById('tab-charts');
-  const history=document.getElementById('tab-history');
-  const isMobile=window.innerWidth<=768;
-  
-  if(!isMobile)return; // on desktop all tabs always visible
-  
-  [portfolio,positions,charts,history].forEach(el=>{{if(el)el.style.display='none'}});
-  
-  if(tab==='portfolio'){{
-    if(portfolio)portfolio.style.display='flex';
-    if(positions)positions.style.display='block';
-  }}else if(tab==='positions'){{
-    if(positions)positions.style.display='block';
-  }}else if(tab==='charts'){{
-    if(charts)charts.style.display='grid';
-  }}else if(tab==='history'){{
-    if(history)history.style.display='block';
-  }}
-}}
+// Tab switching handled by showTab() defined below (after MA section)
 
 // Mobile card expand
 function toggleMCard(el){{
@@ -726,6 +745,62 @@ if(WR>=95){{
 // PWA install prompt
 let deferredPrompt;
 window.addEventListener('beforeinstallprompt',e=>{{deferredPrompt=e}});
+
+// MA Strategy
+const MA_EQ={ma_eq_js};
+const MA_TD={ma_td_js};
+const malc=document.getElementById('maLineChart');
+if(malc){{
+  const isP=MA_EQ[MA_EQ.length-1]>=0;
+  const g=malc.getContext('2d').createLinearGradient(0,0,0,150);
+  isP?(g.addColorStop(0,'rgba(0,200,150,0.25)'),g.addColorStop(1,'rgba(0,200,150,0)'))
+     :(g.addColorStop(0,'rgba(255,71,87,0.25)'),g.addColorStop(1,'rgba(255,71,87,0)'));
+  new Chart(malc,{{type:'line',data:{{
+    labels:MA_EQ.map((_,i)=>'T'+(i+1)),
+    datasets:[{{data:MA_EQ,borderColor:isP?'#00C896':'#FF4757',backgroundColor:g,
+      fill:true,tension:0.4,pointRadius:4,pointHoverRadius:8,
+      pointBackgroundColor:isP?'#00C896':'#FF4757',
+      pointBorderColor:'#020408',pointBorderWidth:2,borderWidth:2}}]
+  }},options:{{responsive:true,maintainAspectRatio:false,
+    plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>' '+fi(c.raw,true)}},
+      backgroundColor:'#080D18',borderColor:'rgba(245,166,35,0.3)',borderWidth:1,
+      titleColor:'#F5A623',bodyColor:'#E8F0FF',padding:10,cornerRadius:8}}}},
+    scales:{{x:{{ticks:{{color:'#3D4F6A',maxTicksLimit:8}},grid:{{color:'rgba(255,255,255,0.03)'}}}},
+             y:{{ticks:{{color:'#3D4F6A',callback:v=>fi(v)}},grid:{{color:'rgba(255,255,255,0.04)'}}}}}}
+  }}}});
+}}
+async function refreshMA(){{
+  for(const t of MA_TD){{
+    try{{
+      const r=await fetch('https://query2.finance.yahoo.com/v8/finance/chart/'+t.sym+'.NS?interval=15m&range=1d',{{headers:{{'User-Agent':'Mozilla/5.0'}}}});
+      const d=await r.json();
+      const cmp=parseFloat(d.chart.result[0].meta.regularMarketPrice);
+      const pnl=(cmp-t.entry)*t.qty; const pct=(cmp-t.entry)/t.entry*100;
+      const ce=document.getElementById('ma_cmp_'+t.sym);
+      const pe=document.getElementById('ma_pnl_'+t.sym);
+      const pce=document.getElementById('ma_pct_'+t.sym);
+      if(ce)ce.textContent='Rs'+cmp.toFixed(2);
+      if(pe){{pe.textContent=fi(pnl,true);pe.style.color=pnl>=0?'var(--green)':'var(--red)';}}
+      if(pce){{pce.textContent=pct.toFixed(2)+'%';pce.className='ppct '+(pct>=0?'pos':'neg');}}
+    }}catch(e){{}}
+  }}
+}}
+if(MA_TD.length>0){{refreshMA();setInterval(refreshMA,15000);}}
+function showTab(tab,btn){{
+  document.querySelectorAll('.mnav-btn').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  const tabs=['portfolio','positions','charts','history','ma'];
+  if(window.innerWidth>768)return;
+  tabs.forEach(id=>{{const el=document.getElementById('tab-'+id);if(el)el.style.display='none';}});
+  if(tab==='portfolio'){{
+    const p=document.getElementById('tab-portfolio');if(p)p.style.display='flex';
+    const pos=document.getElementById('tab-positions');if(pos)pos.style.display='block';
+  }}else{{
+    const el=document.getElementById('tab-'+tab);
+    if(el)el.style.display=tab==='charts'?'grid':'block';
+  }}
+}}
+
 </script>
 </body></html>"""
 

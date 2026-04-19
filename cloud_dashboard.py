@@ -663,7 +663,7 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
         <div class="macro-kpi">
           <div class="mkpi">
             <div class="mkpi-lbl">Nifty 50</div>
-            <div class="mkpi-val" id="mac-nifty" style="color:{'var(--green)' if (np or 0)>=0 else 'var(--red)'}">{'%,.0f' % nc if nc else '—'}</div>
+            <div class="mkpi-val" id="mac-nifty" style="color:{'var(--green)' if (np or 0)>=0 else 'var(--red)'}">{int(nc) if nc else '—'}</div>
             <div class="mkpi-note" id="mac-nifty-ch">{'%+.2f%%' % np if np else '—'} today</div>
           </div>
           <div class="mkpi">

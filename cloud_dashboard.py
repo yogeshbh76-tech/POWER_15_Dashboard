@@ -84,98 +84,6 @@ def get_yahoo(sym, suffix=".NS", interval="1d", range_="5d"):
         return r.json()["chart"]["result"][0]
     except: return None
 
-# ── VCP Detection ─────────────────────────────────────────────────────────────
-def detect_vcp(sym, is_commodity=False):
-    """
-    Detect VCP pattern on daily candles.
-    Returns dict with stage, score, pivot, sl, contractions or None.
-    """
-    suffix = ".NS" if not is_commodity else ""
-    if is_commodity:
-        mcx_map = {"GOLD":"GC=F","SILVER":"SI=F","CRUDEOIL":"CL=F"}
-        sym_fetch = mcx_map.get(sym, sym)
-        suffix = ""
-    else:
-        sym_fetch = sym
-
-    try:
-        r = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym_fetch}{suffix}?interval=1d&range=90d",
-            headers={"User-Agent":"Mozilla/5.0"}, timeout=12)
-        data = r.json()["chart"]["result"][0]
-        q    = data["indicators"]["quote"][0]
-        closes= [c for c in q.get("close",[]) if c]
-        highs = [c for c in q.get("high", []) if c]
-        lows  = [c for c in q.get("low",  []) if c]
-        vols  = [v for v in q.get("volume",[]) if v]
-        if len(closes) < 30: return None
-        cmp   = float(data["meta"]["regularMarketPrice"])
-
-        # Find swing highs/lows using simple peak detection
-        swings = []
-        for i in range(2, len(closes)-2):
-            if highs[i] > highs[i-1] and highs[i] > highs[i+1] and highs[i] > highs[i-2]:
-                swings.append(("H", i, highs[i]))
-            elif lows[i] < lows[i-1] and lows[i] < lows[i+1] and lows[i] < lows[i-2]:
-                swings.append(("L", i, lows[i]))
-
-        # Extract pullback ranges (High→Low sequences)
-        pullbacks = []
-        for j in range(len(swings)-1):
-            if swings[j][0]=="H" and swings[j+1][0]=="L":
-                hi, lo = swings[j][2], swings[j+1][2]
-                pct = (hi-lo)/hi*100
-                pullbacks.append({"hi":hi,"lo":lo,"pct":round(pct,2),
-                                   "hi_idx":swings[j][1],"lo_idx":swings[j+1][1]})
-
-        if len(pullbacks) < 2: return None
-
-        # Check contracting pullbacks
-        recent = pullbacks[-3:] if len(pullbacks)>=3 else pullbacks[-2:]
-        contracting = all(recent[i]["pct"] > recent[i+1]["pct"] for i in range(len(recent)-1))
-        if not contracting: return None
-
-        # Volume dry-up check: last 5 candles avg vol < 20-day avg
-        avg20  = sum(vols[-20:])/20 if len(vols)>=20 else 1
-        avg5   = sum(vols[-5:])/5   if len(vols)>=5 else 1
-        vol_dry = avg5 < avg20 * 0.8
-
-        # Score calculation
-        score = 0
-        c_count = len(recent)
-        if c_count >= 3: score += 2
-        elif c_count == 2: score += 1
-        if vol_dry: score += 2
-        # Each contraction < 8% adds quality
-        if recent[-1]["pct"] < 6: score += 2
-        elif recent[-1]["pct"] < 10: score += 1
-        # Price above 50-day MA
-        ma50 = sum(closes[-50:])/50 if len(closes)>=50 else closes[-1]
-        if cmp > ma50: score += 1
-        # Trend check: 20-day MA rising
-        ma20_now  = sum(closes[-20:])/20
-        ma20_prev = sum(closes[-25:-5])/20
-        if ma20_now > ma20_prev: score += 1
-
-        pivot = recent[-1]["hi"]  # breakout level = last swing high
-        sl    = round(recent[-1]["lo"] * 0.99, 2)  # 1% below C3 low
-
-        return {
-            "symbol":     sym,
-            "cmp":        round(cmp, 2),
-            "score":      score,
-            "max_score":  8,
-            "contractions": len(recent),
-            "c_pcts":     [r["pct"] for r in recent],
-            "pivot":      round(pivot, 2),
-            "sl":         sl,
-            "vol_dry":    vol_dry,
-            "above_ma50": cmp > ma50,
-            "stage":      "C3-FORMING" if cmp < pivot * 1.005 else "BREAKOUT",
-            "t1":         round(pivot * 1.08, 2),
-            "t2":         round(pivot * 1.15, 2),
-        }
-    except: return None
 
 # ── Macro Data ────────────────────────────────────────────────────────────────
 def fetch_macro():
@@ -1043,8 +951,8 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
     </div>
     <div class="module-right">
       <div class="module-stats">
-        <div class="mstat highlight">{len(vcp['eq'])} EQ signals</div>
-        <div class="mstat" style="color:var(--purple)">{len(vcp['com'])} COM signals</div>
+        <div class="mstat highlight">{len(vcp['eq_signals'])} EQ signals</div>
+        <div class="mstat" style="color:var(--purple)">{len(vcp['com_signals'])} COM signals</div>
       </div>
       <div class="chevron">▾</div>
     </div>

@@ -385,25 +385,103 @@ def build_p15():
         "ma_eq_js":ma_eq_js,"ma_td_js":ma_td_js
     }
 
-# ── VCP Scan ──────────────────────────────────────────────────────────────────
+# ── VCP Data from Supabase ────────────────────────────────────────────────────
 def build_vcp():
-    eq_signals=[]; com_signals=[]
-    # Equity scan (sample 6 stocks to keep response fast)
-    sample_eq = list(VCP_EQ_STOCKS.keys())[:8]
-    for sym in sample_eq:
-        sig = detect_vcp(sym, is_commodity=False)
-        if sig and sig["score"] >= 4:
-            sig["sector"] = VCP_EQ_STOCKS.get(sym,"—")
-            eq_signals.append(sig)
-    eq_signals.sort(key=lambda x: x["score"], reverse=True)
-    # Commodity scan
-    for sym in VCP_COM_STOCKS:
-        sig = detect_vcp(sym, is_commodity=True)
-        if sig:
-            sig["sector"] = VCP_COM_STOCKS.get(sym,"—")
-            com_signals.append(sig)
-    com_signals.sort(key=lambda x: x["score"], reverse=True)
-    return {"eq": eq_signals, "com": com_signals}
+    """
+    Read VCP signals and trades from Supabase.
+    vcp_scanner.py writes here; dashboard just reads.
+    """
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+
+    # ── Signals (today's detections) ──────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/vcp_signals"
+            f"?signal_date=eq.{today}&select=*&order=score.desc",
+            headers=HDR, timeout=10)
+        all_signals = r.json() if r.status_code == 200 else []
+    except:
+        all_signals = []
+
+    eq_signals  = [s for s in all_signals if s.get("market","EQUITY") == "EQUITY"]
+    com_signals = [s for s in all_signals if s.get("market") == "COMMODITY"]
+
+    # ── Open trades ────────────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/vcp_trades?status=eq.OPEN&select=*&order=entry_date.desc",
+            headers=HDR, timeout=10)
+        open_trades = r.json() if r.status_code == 200 else []
+    except:
+        open_trades = []
+
+    # Enrich open trades with live CMP
+    enriched_trades = []
+    for t in open_trades:
+        try:
+            sym = t["symbol"]
+            r2  = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}.NS"
+                f"?interval=1d&range=2d",
+                headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+            cmp = float(r2.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        except:
+            cmp = t["entry_price"]
+        pnl = round((cmp - t["entry_price"]) * t["quantity"], 2)
+        pct = round((cmp - t["entry_price"]) / t["entry_price"] * 100, 2)
+        enriched_trades.append({**t, "cmp": cmp, "live_pnl": pnl, "live_pct": pct})
+
+    # ── Closed trades (all-time) ───────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/vcp_trades"
+            f"?status=eq.CLOSED&select=*&order=exit_date.desc&limit=20",
+            headers=HDR, timeout=10)
+        closed_trades = r.json() if r.status_code == 200 else []
+    except:
+        closed_trades = []
+
+    # ── Capital ────────────────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/vcp_capital?select=*&limit=1",
+            headers=HDR, timeout=10)
+        cap_rows = r.json() if r.status_code == 200 else []
+        cap = cap_rows[0] if cap_rows else {
+            "initial":300000,"available":300000,"invested":0,
+            "total_pnl":0,"total_trades":0,"winning_trades":0
+        }
+    except:
+        cap = {"initial":300000,"available":300000,"invested":0,
+               "total_pnl":0,"total_trades":0,"winning_trades":0}
+
+    # Live unrealised P&L
+    live_unreal = sum(t["live_pnl"] for t in enriched_trades)
+    total_pnl   = round(cap["total_pnl"] + live_unreal, 2)
+    ret_pct     = round(total_pnl / cap["initial"] * 100, 2) if cap["initial"] > 0 else 0
+    wr          = round(cap["winning_trades"] / cap["total_trades"] * 100, 1) if cap["total_trades"] > 0 else 0
+    ip          = round(min(100, cap["invested"] / cap["initial"] * 100), 1) if cap["initial"] > 0 else 0
+
+    # P&L curve from closed trades
+    ph2 = []; run = 0
+    for t in sorted(closed_trades, key=lambda x: x.get("exit_date","0")):
+        run += t.get("pnl", 0)
+        ph2.append(round(run, 2))
+
+    return {
+        "eq_signals":      eq_signals,
+        "com_signals":     com_signals,
+        "open_trades":     enriched_trades,
+        "closed_trades":   closed_trades,
+        "cap":             cap,
+        "live_unreal":     live_unreal,
+        "total_pnl":       total_pnl,
+        "ret_pct":         ret_pct,
+        "wr":              wr,
+        "ip":              ip,
+        "ph2":             ph2,
+        "scanner_active":  len(all_signals) > 0,  # True if scanner ran today
+    }
 
 # ── Build HTML ────────────────────────────────────────────────────────────────
 def build():
@@ -420,55 +498,63 @@ def build():
     ms=p15["ms"]; mscol=p15["mscol"]
     sj=p15["sj"]; pj=p15["pj"]; syms=p15["syms"]; td=p15["td"]; cr2=p15["cr2"]
 
-    # VCP signal cards (equity)
+    # VCP signal cards (equity) — reads from Supabase vcp_signals
     def score_bar(s, mx=8):
         pct = s/mx*100
         col = "#00C896" if s>=6 else ("#F59E0B" if s>=4 else "#FF4757")
         return f'<div class="sbar-wrap"><div class="sbar-fill" style="width:{pct:.0f}%;background:{col}"></div></div><span class="sbar-val" style="color:{col}">{s}/{mx}</span>'
 
     eq_cards=""
-    for sig in vcp["eq"]:
-        bc="#00C896" if sig["stage"]=="BREAKOUT" else "#F59E0B"
-        stage_icon="🚀" if sig["stage"]=="BREAKOUT" else "🔍"
-        contr_str=" → ".join([f"{p:.1f}%" for p in sig["c_pcts"]])
-        eq_cards+=f"""<div class="vcp-card">
+    for sig in vcp["eq_signals"]:
+        bc="#00C896" if sig.get("stage")=="BREAKOUT" else "#F59E0B"
+        stage_icon="🚀" if sig.get("stage")=="BREAKOUT" else "🔍"
+        try:
+            c_pcts = json.loads(sig.get("c_pcts","[]")) if isinstance(sig.get("c_pcts"), str) else (sig.get("c_pcts") or [])
+            contr_str = " → ".join([f"{p:.1f}%" for p in c_pcts])
+        except:
+            contr_str = "—"
+        acted = sig.get("acted_upon", False)
+        eq_cards+=f"""<div class="vcp-card {'vcp-traded' if acted else ''}">
   <div class="vcp-card-top">
     <div>
-      <div class="vcp-sym">{sig['symbol']}</div>
-      <div class="vcp-sector">{sig['sector']}</div>
+      <div class="vcp-sym">{sig['symbol']} {' <span class="traded-tag">📂 TRADED</span>' if acted else ''}</div>
+      <div class="vcp-sector">{sig.get('sector','—')}</div>
     </div>
-    <div class="vcp-badge" style="background:{'rgba(0,200,150,0.15)' if sig['stage']=='BREAKOUT' else 'rgba(245,166,35,0.12)'};color:{bc};border-color:{bc}30">{stage_icon} {sig['stage']}</div>
+    <div class="vcp-badge" style="background:{'rgba(0,200,150,0.15)' if sig.get('stage')=='BREAKOUT' else 'rgba(245,166,35,0.12)'};color:{bc};border-color:{bc}30">{stage_icon} {sig.get('stage','—')}</div>
   </div>
   <div class="vcp-metrics">
-    <div class="vcp-m"><span>CMP</span><b>₹{sig['cmp']:.2f}</b></div>
-    <div class="vcp-m"><span>Pivot</span><b style="color:#4A9EFF">₹{sig['pivot']:.2f}</b></div>
-    <div class="vcp-m"><span>SL</span><b style="color:#FF4757">₹{sig['sl']:.2f}</b></div>
-    <div class="vcp-m"><span>T1</span><b style="color:#00C896">₹{sig['t1']:.2f}</b></div>
+    <div class="vcp-m"><span>CMP</span><b>₹{float(sig.get('cmp',0)):.2f}</b></div>
+    <div class="vcp-m"><span>Pivot</span><b style="color:#4A9EFF">₹{float(sig.get('pivot',0)):.2f}</b></div>
+    <div class="vcp-m"><span>SL</span><b style="color:#FF4757">₹{float(sig.get('sl_price',0)):.2f}</b></div>
+    <div class="vcp-m"><span>T1</span><b style="color:#00C896">₹{float(sig.get('target1',0)):.2f}</b></div>
   </div>
   <div class="vcp-contractions">Contractions: <span style="color:#F59E0B">{contr_str}</span></div>
-  <div class="vcp-score-row">Score: {score_bar(sig['score'])} {'💧 Vol Dry' if sig['vol_dry'] else ''} {'📈 Above MA50' if sig['above_ma50'] else ''}</div>
+  <div class="vcp-score-row">Score: {score_bar(sig.get('score',0))} {'💧 Vol Dry' if sig.get('vol_dry') else ''} {'📈 Above MA50' if sig.get('above_ma50') else ''}</div>
+  <div class="vcp-time">Detected: {str(sig.get('signal_time',''))[:5]}</div>
 </div>"""
 
     com_cards=""
-    for sig in vcp["com"]:
-        bc="#00C896" if sig["stage"]=="BREAKOUT" else "#F59E0B"
-        stage_icon="🚀" if sig["stage"]=="BREAKOUT" else "🔍"
-        contr_str=" → ".join([f"{p:.1f}%" for p in sig["c_pcts"]])
-        t1_pct = 2.5 if sig["symbol"]=="GOLD" else 4.0
-        t2_pct = 4.5 if sig["symbol"]=="GOLD" else 7.0
+    for sig in vcp["com_signals"]:
+        bc="#00C896" if sig.get("stage")=="BREAKOUT" else "#F59E0B"
+        stage_icon="🚀" if sig.get("stage")=="BREAKOUT" else "🔍"
+        try:
+            c_pcts    = json.loads(sig.get("c_pcts","[]")) if isinstance(sig.get("c_pcts"), str) else (sig.get("c_pcts") or [])
+            contr_str = " → ".join([f"{p:.1f}%" for p in c_pcts])
+        except:
+            contr_str = "—"
         com_cards+=f"""<div class="vcp-card vcp-com">
   <div class="vcp-card-top">
     <div>
       <div class="vcp-sym">{sig['symbol']} <span style="font-size:10px;color:#A855F7">MCX</span></div>
-      <div class="vcp-sector">{sig['sector']} · Options Play</div>
+      <div class="vcp-sector">{sig.get('sector','—')} · Options Play</div>
     </div>
-    <div class="vcp-badge" style="background:rgba(168,85,247,0.12);color:#A855F7;border-color:#A855F730">{stage_icon} {sig['stage']}</div>
+    <div class="vcp-badge" style="background:rgba(168,85,247,0.12);color:#A855F7;border-color:#A855F730">{stage_icon} {sig.get('stage','—')}</div>
   </div>
   <div class="vcp-metrics">
-    <div class="vcp-m"><span>CMP</span><b>₹{sig['cmp']:.0f}</b></div>
-    <div class="vcp-m"><span>Pivot</span><b style="color:#4A9EFF">₹{sig['pivot']:.0f}</b></div>
-    <div class="vcp-m"><span>SL</span><b style="color:#FF4757">₹{sig['sl']:.0f}</b></div>
-    <div class="vcp-m"><span>T1</span><b style="color:#00C896">+{t1_pct}%</b></div>
+    <div class="vcp-m"><span>CMP</span><b>₹{float(sig.get('cmp',0)):.0f}</b></div>
+    <div class="vcp-m"><span>Pivot</span><b style="color:#4A9EFF">₹{float(sig.get('pivot',0)):.0f}</b></div>
+    <div class="vcp-m"><span>SL</span><b style="color:#FF4757">₹{float(sig.get('sl_price',0)):.0f}</b></div>
+    <div class="vcp-m"><span>T1</span><b style="color:#00C896">₹{float(sig.get('target1',0)):.0f}</b></div>
   </div>
   <div class="vcp-contractions">Contractions: <span style="color:#F59E0B">{contr_str}</span></div>
   <div class="vcp-opt-guide">
@@ -476,11 +562,65 @@ def build():
     <span class="opt-tag">15-21 days expiry</span>
     <span class="opt-tag">Low IV entry</span>
   </div>
-  <div class="vcp-score-row">Score: {score_bar(sig['score'])} {'💧 Vol Dry' if sig['vol_dry'] else ''}</div>
+  <div class="vcp-score-row">Score: {score_bar(sig.get('score',0))} {'💧 Vol Dry' if sig.get('vol_dry') else ''}</div>
 </div>"""
 
-    if not vcp["eq"] and not vcp["com"]:
-        eq_cards='<div class="vcp-empty">🔍 No high-score VCP setups detected today. Scanner runs daily post-market. Check back after 4 PM IST.</div>'
+    # VCP Open Trades table rows
+    vcp_open_rows = ""
+    for t in vcp["open_trades"]:
+        pnl  = t.get("live_pnl", 0)
+        pct  = t.get("live_pct", 0)
+        col  = "#00C896" if pnl >= 0 else "#FF4757"
+        cmp  = t.get("cmp", t["entry_price"])
+        try:
+            entry_dt = datetime.strptime(t["entry_date"], "%Y-%m-%d")
+            hold_days = (datetime.now() - entry_dt).days
+        except:
+            hold_days = 0
+        trail = "🔄" if t.get("t1_hit") else ""
+        vcp_open_rows += f"""<tr class="pos-row">
+  <td><div class="psym"><div class="pdot" style="background:#4A9EFF"></div>
+    <div><div class="psn">{t['symbol']}</div>
+    <div class="pss">{t.get('sector','—')} · Score {t.get('score',0)}/8</div></div></div></td>
+  <td class="mc">{t.get('entry_date','')}</td>
+  <td style="font-family:monospace;font-size:12px">₹{float(t['entry_price']):.2f}</td>
+  <td class="pcmp" id="vcmp_{t['symbol']}">₹{cmp:.2f}</td>
+  <td style="color:{col};font-weight:700;font-family:monospace" id="vpnl_{t['symbol']}">{fi(pnl,True)}</td>
+  <td><span class="ppct {'pos' if pct>=0 else 'neg'}" id="vpct_{t['symbol']}">{pct:+.2f}%</span></td>
+  <td style="font-family:monospace;font-size:11px;color:#FF4757">₹{float(t.get('sl_price',0)):.2f}</td>
+  <td style="font-family:monospace;font-size:11px;color:#00C896">₹{float(t.get('target1',0)):.2f}</td>
+  <td class="mc">{hold_days}d / 30d</td>
+  <td>{trail} {'<span style="color:#F59E0B;font-size:11px">T1 HIT</span>' if t.get('t1_hit') else '<span style="color:#00C896;font-size:11px">HOLD</span>'}</td>
+</tr>"""
+
+    # VCP Closed Trades table rows
+    vcp_closed_rows = ""
+    for t in vcp["closed_trades"][:15]:
+        pnl  = t.get("pnl", 0)
+        pct  = t.get("pnl_pct", 0)
+        col  = "#00C896" if pnl >= 0 else "#FF4757"
+        r2   = t.get("exit_reason","")
+        icon = "🛑" if "Stop" in r2 else ("🔄" if "Trail" in r2 else ("🎯" if "Target" in r2 else "⏰"))
+        vcp_closed_rows += f"""<tr class="cr">
+  <td><span class="stag">{t['symbol']}</span></td>
+  <td class="mc">{t.get('entry_date','')}</td>
+  <td class="mc">{t.get('exit_date','')}</td>
+  <td class="mc">₹{float(t['entry_price']):.2f}</td>
+  <td class="mc">₹{float(t.get('exit_price',0)):.2f}</td>
+  <td style="color:{col};font-weight:700">{fi(pnl,True)}</td>
+  <td style="color:{col};font-weight:700">{float(pct):+.1f}%</td>
+  <td class="mc" style="font-size:10px">{icon} {r2[:30]}</td>
+  <td class="mc">{t.get('score',0)}/8</td>
+</tr>"""
+
+    scanner_status = (
+        '<span style="color:#00C896">● ACTIVE TODAY</span>'
+        if vcp["scanner_active"] else
+        '<span style="color:#FF4757">● NOT RUN TODAY — start vcp_scanner.py</span>'
+    )
+
+    if not vcp["eq_signals"] and not vcp["com_signals"]:
+        eq_cards=f'<div class="vcp-empty">📡 Scanner status: {scanner_status}<br><br>No signals yet today. Run <b>vcp_scanner.py</b> on your PC to start scanning. Signals will appear here automatically.</div>'
 
     # Macro signal cards
     def sig_chip(label, val, chg, signal, col_map, unit="", chg_unit=""):
@@ -714,7 +854,9 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
 .sbar-val{{font-size:11px;font-weight:700;margin-left:6px}}
 .vcp-opt-guide{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}}
 .opt-tag{{font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:'JetBrains Mono',monospace}}
-.vcp-empty{{padding:40px 20px;text-align:center;color:var(--sub);font-size:13px}}
+.vcp-traded{{border-left:3px solid var(--green)}}
+.traded-tag{{font-size:9px;font-weight:700;padding:1px 6px;border-radius:4px;background:rgba(0,200,150,0.1);color:var(--green);border:1px solid rgba(0,200,150,0.2);font-family:'JetBrains Mono',monospace;vertical-align:middle}}
+.vcp-time{{font-size:9px;color:var(--mut);font-family:'JetBrains Mono',monospace;margin-top:6px}}
 .vcp-section-title{{padding:14px 16px 0;font-size:10px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1.5px;font-family:'JetBrains Mono',monospace;display:flex;align-items:center;gap:8px}}
 .vcp-section-title::before{{content:'';width:3px;height:10px;border-radius:2px;flex-shrink:0}}
 .vcp-eq-title::before{{background:var(--blue)}}
@@ -909,20 +1051,33 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
   </div>
   <div class="module-body">
     <div class="pi">
+      <!-- VCP KPI Stats Row -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;padding:0 0 4px">
+        <div class="sb-stat"><div class="sb-sl">Total P&L</div><div class="sb-sv" style="color:{'var(--green)' if vcp['total_pnl']>=0 else 'var(--red)'}">{ fi(vcp['total_pnl'],True)}</div></div>
+        <div class="sb-stat"><div class="sb-sl">Return</div><div class="sb-sv" style="color:{'var(--green)' if vcp['ret_pct']>=0 else 'var(--red)'}">{vcp['ret_pct']:+.2f}%</div></div>
+        <div class="sb-stat"><div class="sb-sl">Available</div><div class="sb-sv" style="color:var(--blue)">{fi(vcp['cap']['available'])}</div></div>
+        <div class="sb-stat"><div class="sb-sl">Invested</div><div class="sb-sv" style="color:var(--gold)">{fi(vcp['cap']['invested'])}</div></div>
+        <div class="sb-stat"><div class="sb-sl">Win Rate</div><div class="sb-sv" style="color:var(--purple)">{vcp['wr']:.0f}%</div></div>
+        <div class="sb-stat"><div class="sb-sl">Trades</div><div class="sb-sv" style="color:var(--cyan)">{vcp['cap']['total_trades']}</div></div>
+        <div class="sb-stat"><div class="sb-sl">Unrealised</div><div class="sb-sv" style="color:{'var(--green)' if vcp['live_unreal']>=0 else 'var(--red)'}" id="vcp-unreal">{fi(vcp['live_unreal'],True)}</div></div>
+        <div class="sb-stat"><div class="sb-sl">Scanner</div><div class="sb-sv" style="font-size:10px">{ '🟢 ON' if vcp['scanner_active'] else '🔴 OFF'}</div></div>
+      </div>
+
       <!-- VCP Info Banner -->
       <div style="background:var(--s2);border:1px solid rgba(74,158,255,0.2);border-left:3px solid var(--blue);border-radius:10px;padding:12px 16px;font-size:12px;color:var(--sub);line-height:1.6">
         <span style="color:var(--blue);font-weight:700;font-family:'JetBrains Mono',monospace">VCP RULES: </span>
         3 contracting pullbacks · Each smaller than previous · Volume dries up on C3 · Breakout on 1.5x vol · Score ≥5 = high conviction
+        &nbsp;·&nbsp; Scanner: {scanner_status}
       </div>
 
       <!-- Equity VCP Signals -->
       <div class="card">
         <div class="card-hdr">
-          <div class="card-title" style="--accent:var(--blue)">Equity VCP Signals · NSE Daily</div>
-          <div class="badge" style="color:var(--blue);border-color:rgba(74,158,255,0.3);background:rgba(74,158,255,0.08)">{len(vcp['eq'])} SIGNALS</div>
+          <div class="card-title">Equity VCP Signals · NSE Daily</div>
+          <div class="badge" style="color:var(--blue);border-color:rgba(74,158,255,0.3);background:rgba(74,158,255,0.08)">{len(vcp['eq_signals'])} SIGNALS</div>
         </div>
         <div class="vcp-grid" id="vcpEqGrid">
-          {eq_cards if vcp['eq'] else '<div class="vcp-empty">🔍 No high-score VCP setups detected today. Scanner runs on daily candles — check back after market close.</div>'}
+          {eq_cards}
         </div>
       </div>
 
@@ -930,10 +1085,49 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
       <div class="card">
         <div class="card-hdr">
           <div class="card-title">Commodity VCP · MCX Gold & Silver · Options Setup</div>
-          <div class="badge" style="color:#A855F7;border-color:rgba(168,85,247,0.3);background:rgba(168,85,247,0.08)">{len(vcp['com'])} SIGNALS</div>
+          <div class="badge" style="color:#A855F7;border-color:rgba(168,85,247,0.3);background:rgba(168,85,247,0.08)">{len(vcp['com_signals'])} SIGNALS</div>
         </div>
         <div class="vcp-grid">
-          {com_cards if vcp['com'] else '<div class="vcp-empty">🔍 No commodity VCP setups currently qualifying. Gold and Silver scanned daily.</div>'}
+          {com_cards if vcp['com_signals'] else '<div class="vcp-empty">No commodity VCP signals today.</div>'}
+        </div>
+      </div>
+
+      <!-- VCP Open Trades -->
+      <div class="card">
+        <div class="card-hdr">
+          <div class="card-title">VCP Open Trades · Paper Trading</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div class="upd-dot"></div>
+            <div class="badge" style="color:var(--blue)">{len(vcp['open_trades'])} OPEN</div>
+          </div>
+        </div>
+        {f'''<div class="desk-table"><table class="pos-table">
+          <thead><tr>
+            <th>Symbol</th><th>Date</th><th>Entry</th>
+            <th>CMP <span style="color:var(--green);font-size:8px">● LIVE</span></th>
+            <th>P&L</th><th>Ret%</th><th>SL</th><th>T1</th><th>Hold</th><th>Status</th>
+          </tr></thead>
+          <tbody id="vcpOpenBody">{vcp_open_rows}</tbody>
+        </table></div>''' if vcp['open_trades'] else
+        '<div class="empty" style="padding:30px"><div style="font-size:28px">📂</div><div>No open VCP trades</div><div style="font-size:11px;color:var(--sub)">Breakout signals auto-open paper trades</div></div>'}
+      </div>
+
+      <!-- VCP P&L Curve + Closed Trades -->
+      <div class="charts-row" style="grid-template-columns:1fr 2fr">
+        <div class="cc">
+          <div class="ctitle">VCP P&L Curve</div>
+          <div class="cw"><canvas id="vcpLineChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-hdr">
+            <div class="card-title">VCP Trade History</div>
+            <div class="badge">LAST {min(15, len(vcp['closed_trades']))}</div>
+          </div>
+          {f'''<div style="overflow-x:auto"><table class="ct">
+            <thead><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>Buy</th><th>Sell</th><th>P&L</th><th>Ret%</th><th>Reason</th><th>Score</th></tr></thead>
+            <tbody>{vcp_closed_rows}</tbody>
+          </table></div>''' if vcp['closed_trades'] else
+          '<div class="empty" style="padding:30px"><div>No closed trades yet</div><div style="font-size:11px;color:var(--sub)">History will appear here</div></div>'}
         </div>
       </div>
 
@@ -943,11 +1137,11 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
         <div style="display:flex;flex-wrap:wrap;gap:6px">
           {''.join([f'<span style="font-family:monospace;font-size:10px;padding:3px 8px;border-radius:5px;background:var(--s3);color:var(--sub);border:1px solid var(--bdr)">{s}</span>' for s in VCP_EQ_STOCKS.keys()])}
         </div>
-        <div style="font-size:9px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1.5px;font-family:'JetBrains Mono',monospace;margin:12px 0 8px">COMMODITY UNIVERSE</div>
+        <div style="font-size:9px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1.5px;font-family:'JetBrains Mono',monospace;margin:12px 0 8px">COMMODITY UNIVERSE (MCX OPTIONS)</div>
         <div style="display:flex;gap:6px">
-          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">GOLD MCX</span>
-          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">SILVER MCX</span>
-          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">CRUDE OIL MCX</span>
+          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">GOLD</span>
+          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">SILVER</span>
+          <span style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(168,85,247,0.1);color:#A855F7;border:1px solid rgba(168,85,247,0.2);font-family:monospace">CRUDE OIL</span>
         </div>
       </div>
     </div>
@@ -1101,6 +1295,54 @@ if(SD.length&&document.getElementById('pieChart')){{
 if(TD.length&&document.getElementById('barChart')){{
   new Chart(document.getElementById('barChart'),{{type:'bar',data:{{labels:TD.map(t=>t.sym),datasets:[{{data:TD.map(t=>{{const c=prev[t.sym]||t.entry;return(c-t.entry)*t.qty}}),backgroundColor:TD.map(t=>{{const c=prev[t.sym]||t.entry;return c>=t.entry?'rgba(0,200,150,0.65)':'rgba(255,71,87,0.65)'}}),borderColor:TD.map(t=>{{const c=prev[t.sym]||t.entry;return c>=t.entry?'#00C896':'#FF4757'}}),borderWidth:1,borderRadius:5}}]}},options:{{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{{legend:{{display:false}}}},scales:{{x:{{ticks:{{color:'#3D4F6A',callback:v=>fi(v)}},grid:{{color:'rgba(255,255,255,0.04)'}}}},y:{{grid:{{display:false}},ticks:{{color:'#E8F0FF',font:{{weight:'700',size:10}}}}}}}}}} }});
 }}
+
+// VCP P&L Curve
+const VCP_PH={json.dumps(vcp['ph2'])};
+const vcplc=document.getElementById('vcpLineChart');
+if(vcplc&&VCP_PH.length>1){{
+  const isP=VCP_PH[VCP_PH.length-1]>=0;
+  const vg=vcplc.getContext('2d').createLinearGradient(0,0,0,150);
+  isP?(vg.addColorStop(0,'rgba(74,158,255,0.25)'),vg.addColorStop(1,'rgba(74,158,255,0)'))
+     :(vg.addColorStop(0,'rgba(255,71,87,0.25)'),vg.addColorStop(1,'rgba(255,71,87,0)'));
+  new Chart(vcplc,{{type:'line',data:{{
+    labels:VCP_PH.map((_,i)=>'T'+(i+1)),
+    datasets:[{{data:VCP_PH,borderColor:isP?'#4A9EFF':'#FF4757',backgroundColor:vg,
+      fill:true,tension:0.45,pointRadius:VCP_PH.length>15?0:4,pointHoverRadius:7,
+      pointBackgroundColor:isP?'#4A9EFF':'#FF4757',
+      pointBorderColor:'#020408',pointBorderWidth:2,borderWidth:2}}]
+  }},options:{{responsive:true,maintainAspectRatio:false,
+    plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>' '+fi(c.raw,true)}},
+      backgroundColor:'#080D18',borderColor:'rgba(74,158,255,0.3)',borderWidth:1,
+      titleColor:'#4A9EFF',bodyColor:'#E8F0FF',padding:10,cornerRadius:8}}}},
+    scales:{{x:{{ticks:{{color:'#3D4F6A',maxTicksLimit:6}},grid:{{color:'rgba(255,255,255,0.03)'}}}},
+             y:{{ticks:{{color:'#3D4F6A',callback:v=>fi(v)}},grid:{{color:'rgba(255,255,255,0.04)'}}}}}}
+  }}}});
+}}
+
+// VCP open trades live CMP refresh
+const VCP_OPEN_TD={json.dumps([{{"sym":t["symbol"],"entry":float(t["entry_price"]),"qty":t["quantity"]}} for t in vcp["open_trades"]])};
+async function refreshVCPPrices(){{
+  let totalUnreal=0;
+  for(const t of VCP_OPEN_TD){{
+    try{{
+      const r=await fetch('https://query1.finance.yahoo.com/v8/finance/chart/'+t.sym+'.NS',{{headers:{{'User-Agent':'Mozilla/5.0'}}}});
+      const d=await r.json();
+      const cmp=parseFloat(d.chart.result[0].meta.regularMarketPrice);
+      const pnl=(cmp-t.entry)*t.qty;
+      const pct=(cmp-t.entry)/t.entry*100;
+      totalUnreal+=pnl;
+      const ce=document.getElementById('vcmp_'+t.sym);
+      const pe=document.getElementById('vpnl_'+t.sym);
+      const pce=document.getElementById('vpct_'+t.sym);
+      if(ce)ce.textContent='₹'+cmp.toFixed(2);
+      if(pe){{pe.textContent=fi(pnl,true);pe.style.color=pnl>=0?'var(--green)':'var(--red)';}}
+      if(pce){{pce.textContent=pct.toFixed(2)+'%';pce.className='ppct '+(pct>=0?'pos':'neg');}}
+    }}catch(e){{}}
+  }}
+  const ue=document.getElementById('vcp-unreal');
+  if(ue){{ue.textContent=fi(totalUnreal,true);ue.style.color=totalUnreal>=0?'var(--green)':'var(--red)';}}
+}}
+if(VCP_OPEN_TD.length>0){{refreshVCPPrices();setInterval(refreshVCPPrices,15000);}}
 </script>
 </body></html>"""
 

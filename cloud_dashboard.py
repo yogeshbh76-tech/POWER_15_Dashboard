@@ -5,7 +5,7 @@ Three-Module Dashboard:
   ② VCP Strategy (collapsible)    — Equity + Commodity VCP signals
   ③ Macro Intelligence (collapsible) — India macro + FII/DII + global signals
 """
-import os, json, requests, re
+import os, json, requests
 from datetime import datetime, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
@@ -1257,24 +1257,56 @@ if(VCP_OPEN_TD.length>0){{refreshVCPPrices();setInterval(refreshVCPPrices,15000)
 # ── Server ────────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path=self.path.split('?')[0]
-        if path=='/manifest.json':
-            manifest=json.dumps({"name":"Power 15 Terminal","short_name":"Power15",
-                "description":"VCP + Macro + Swing Trading Dashboard","start_url":"/",
-                "display":"standalone","background_color":"#020408","theme_color":"#F5A623",
-                "icons":[{"src":"https://img.icons8.com/emoji/96/lightning-emoji.png","sizes":"96x96","type":"image/png"},
-                         {"src":"https://img.icons8.com/emoji/192/lightning-emoji.png","sizes":"192x192","type":"image/png"}]})
-            data=manifest.encode("utf-8")
-            self.send_response(200); self.send_header("Content-type","application/manifest+json"); self.end_headers(); self.wfile.write(data)
-        else:
-            html=build().encode("utf-8")
-            self.send_response(200); self.send_header("Content-type","text/html; charset=utf-8"); self.end_headers(); self.wfile.write(html)
-    def log_message(self,*a): pass
+        path = self.path.split('?')[0]
 
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",5000))
-    print(f"\n  ⚡ Power 15 Terminal v6.0 — Three Modules — port {port}")
-    print(f"  ① Power 15 (Swing Bot) — RSI + Hybrid exits")
-    print(f"  ② VCP Strategy — Equity (20 stocks) + MCX Commodities")
-    print(f"  ③ Macro Intelligence — VIX/DXY/INR/Crude/Rates\n")
-    HTTPServer(("",port),Handler).serve_forever()
+        # ── /health — instant response for Render health checks ──────────────
+        if path in ('/health', '/ping', '/favicon.ico'):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
+        # ── /manifest.json ────────────────────────────────────────────────────
+        if path == '/manifest.json':
+            manifest = json.dumps({
+                "name": "Power 15 Terminal", "short_name": "Power15",
+                "description": "VCP + Macro + Swing Trading Dashboard",
+                "start_url": "/", "display": "standalone",
+                "background_color": "#020408", "theme_color": "#F5A623",
+                "icons": [
+                    {"src": "https://img.icons8.com/emoji/96/lightning-emoji.png",  "sizes": "96x96",  "type": "image/png"},
+                    {"src": "https://img.icons8.com/emoji/192/lightning-emoji.png", "sizes": "192x192","type": "image/png"}
+                ]
+            })
+            data = manifest.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "application/manifest+json")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        # ── Main dashboard ────────────────────────────────────────────────────
+        try:
+            html = build().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        except Exception as e:
+            error_page = f"<h1>Build Error</h1><pre>{e}</pre>".encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(error_page)
+
+    def log_message(self, *a): pass
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n  ⚡ Power 15 Terminal v6.0 — port {port}")
+    print(f"  ① Power 15  ② VCP Strategy  ③ Macro Intelligence\n")
+    server = HTTPServer(("", port), Handler)
+    print(f"  Listening on port {port}...")
+    server.serve_forever()

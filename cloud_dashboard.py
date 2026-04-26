@@ -74,6 +74,144 @@ def get_ma_cmp(symbol):
         return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
     except: return None
 
+# ── VCP Strategy — reads from Supabase (written by vcp_scanner.py) ────────────
+VCP_EQ_STOCKS = {
+    "HDFCBANK":"Banking","ICICIBANK":"Banking","KOTAKBANK":"Banking","BAJFINANCE":"Finance",
+    "BSE":"Capital Mkts","ANGELONE":"Capital Mkts","MUTHOOTFIN":"Finance",
+    "BEL":"Defence","HAL":"Defence","SIEMENS":"Capital Goods",
+    "INFY":"IT","LTIM":"IT","COFORGE":"IT",
+    "SUNPHARMA":"Pharma","DIVISLAB":"Pharma","APOLLOHOSP":"Healthcare",
+    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","RELIANCE":"Energy"
+}
+
+def fetch_vcp_data():
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    # Signals
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/vcp_signals?signal_date=eq.{today}&select=*&order=score.desc", headers=HDR, timeout=8)
+        sigs = r.json() if r.status_code==200 else []
+    except: sigs = []
+    # Open trades
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/vcp_trades?status=eq.OPEN&select=*&order=entry_date.desc", headers=HDR, timeout=8)
+        open_trades = r.json() if r.status_code==200 else []
+    except: open_trades = []
+    # Closed trades
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/vcp_trades?status=eq.CLOSED&select=*&order=exit_date.desc&limit=15", headers=HDR, timeout=8)
+        closed_trades = r.json() if r.status_code==200 else []
+    except: closed_trades = []
+    # Capital
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/vcp_capital?select=*&limit=1", headers=HDR, timeout=8)
+        rows = r.json() if r.status_code==200 else []
+        cap = rows[0] if rows else {"initial":300000,"available":300000,"invested":0,"total_pnl":0,"total_trades":0,"winning_trades":0}
+    except: cap = {"initial":300000,"available":300000,"invested":0,"total_pnl":0,"total_trades":0,"winning_trades":0}
+    # Enrich open trades with live CMP
+    enriched = []
+    for t in open_trades:
+        try:
+            r2 = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{t['symbol']}.NS?interval=1d&range=2d", headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+            cmp = float(r2.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        except: cmp = float(t["entry_price"])
+        pnl = round((cmp - float(t["entry_price"])) * t["quantity"], 2)
+        pct = round((cmp - float(t["entry_price"])) / float(t["entry_price"]) * 100, 2)
+        enriched.append({**t, "cmp": cmp, "live_pnl": pnl, "live_pct": pct})
+    live_unreal = sum(t["live_pnl"] for t in enriched)
+    total_pnl   = round(float(cap["total_pnl"]) + live_unreal, 2)
+    wr = round(cap["winning_trades"]/cap["total_trades"]*100,1) if cap["total_trades"]>0 else 0
+    # P&L curve
+    ph=[]; run=0
+    for t in sorted(closed_trades, key=lambda x:x.get("exit_date","0")):
+        run += float(t.get("pnl",0)); ph.append(round(run,2))
+    eq_sigs  = [s for s in sigs if s.get("market","EQUITY")=="EQUITY"]
+    com_sigs = [s for s in sigs if s.get("market")=="COMMODITY"]
+    return {"eq_sigs":eq_sigs,"com_sigs":com_sigs,"open":enriched,"closed":closed_trades,
+            "cap":cap,"live_unreal":live_unreal,"total_pnl":total_pnl,"wr":wr,"ph":ph,
+            "scanner_on":len(sigs)>0}
+
+def _score_bar(s, mx=8):
+    pct = s/mx*100
+    col = "#00C896" if s>=6 else ("#F59E0B" if s>=4 else "#FF4757")
+    return f'<div style="display:inline-flex;align-items:center;gap:5px"><div style="width:50px;height:4px;background:#17243A;border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle"><div style="width:{pct:.0f}%;height:100%;background:{col};border-radius:2px"></div></div><span style="font-size:11px;font-weight:700;color:{col}">{s}/{mx}</span></div>'
+
+def _build_vcp_signal_cards(eq_sigs, com_sigs, scanner_on):
+    if not eq_sigs and not com_sigs:
+        msg = "📡 Scanner is ON — no qualifying setups yet today." if scanner_on else "🔴 vcp_scanner.py not running. Start it on your PC to see signals here."
+        return f'<div style="padding:30px 20px;text-align:center;color:var(--sub);font-size:13px;width:100%">{msg}</div>'
+    cards = ""
+    for sig in (eq_sigs + com_sigs):
+        is_com = sig.get("market") == "COMMODITY"
+        stage  = sig.get("stage","—")
+        bc     = "#00C896" if stage=="BREAKOUT" else ("#A855F7" if is_com else "#F59E0B")
+        si     = "🚀" if stage=="BREAKOUT" else "🔍"
+        try:
+            c_pcts = json.loads(sig.get("c_pcts","[]")) if isinstance(sig.get("c_pcts"),str) else (sig.get("c_pcts") or [])
+            cs = " → ".join([f"{p:.1f}%" for p in c_pcts])
+        except: cs = "—"
+        acted = "🟢 TRADED" if sig.get("acted_upon") else ""
+        cards += f"""<div class="vcp-sig-card" style="border-left:3px solid {bc}">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+    <div><div style="font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:1px">{sig['symbol']} {'<span style="font-size:10px;color:#A855F7">MCX</span>' if is_com else ''}</div>
+    <div style="font-size:10px;color:var(--sub);font-family:'JetBrains Mono',monospace">{sig.get('sector','—')}</div></div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+      <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;border:1px solid {bc}30;background:{bc}12;color:{bc};font-family:'JetBrains Mono',monospace">{si} {stage}</span>
+      {f'<span style="font-size:9px;color:#00C896;font-family:monospace">{acted}</span>' if acted else ''}
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;margin-bottom:8px">
+    <div style="background:var(--s3);border-radius:7px;padding:6px 8px"><div style="font-size:8px;color:var(--mut);text-transform:uppercase;margin-bottom:2px">CMP</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700">₹{float(sig.get('cmp',0)):.{'0' if is_com else '2'}f}</div></div>
+    <div style="background:var(--s3);border-radius:7px;padding:6px 8px"><div style="font-size:8px;color:var(--mut);text-transform:uppercase;margin-bottom:2px">Pivot</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#4A9EFF">₹{float(sig.get('pivot',0)):.{'0' if is_com else '2'}f}</div></div>
+    <div style="background:var(--s3);border-radius:7px;padding:6px 8px"><div style="font-size:8px;color:var(--mut);text-transform:uppercase;margin-bottom:2px">SL</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#FF4757">₹{float(sig.get('sl_price',0)):.{'0' if is_com else '2'}f}</div></div>
+    <div style="background:var(--s3);border-radius:7px;padding:6px 8px"><div style="font-size:8px;color:var(--mut);text-transform:uppercase;margin-bottom:2px">T1</div><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#00C896">₹{float(sig.get('target1',0)):.{'0' if is_com else '2'}f}</div></div>
+  </div>
+  <div style="font-size:10px;color:var(--sub);font-family:'JetBrains Mono',monospace;margin-bottom:6px">Contractions: <span style="color:#F59E0B">{cs}</span></div>
+  <div style="display:flex;align-items:center;gap:8px;font-size:10px;color:var(--sub);font-family:'JetBrains Mono',monospace">
+    {_score_bar(sig.get('score',0))} {'💧 Vol Dry' if sig.get('vol_dry') else ''} {'📈 MA50' if sig.get('above_ma50') else ''} {'📞 ATM Call · 15-21d expiry' if is_com else ''}
+  </div>
+</div>"""
+    return cards
+
+def _build_vcp_open_rows(trades):
+    rows = ""
+    for t in trades:
+        pnl = t.get("live_pnl",0); pct = t.get("live_pct",0)
+        col = "#00C896" if pnl>=0 else "#FF4757"
+        try:
+            hd = (datetime.now() - datetime.strptime(t["entry_date"],"%Y-%m-%d")).days
+        except: hd = 0
+        rows += f"""<tr class="pos-row">
+  <td><div class="psym"><div class="pdot" style="background:#4A9EFF"></div><div><div class="psn">{t['symbol']}</div><div class="pss">{t.get('sector','—')} · S{t.get('score',0)}/8</div></div></div></td>
+  <td class="mc">{t.get('entry_date','')}</td>
+  <td style="font-family:monospace;font-size:12px">₹{float(t['entry_price']):.2f}</td>
+  <td class="pcmp" id="vcmp_{t['symbol']}">₹{t.get('cmp',t['entry_price']):.2f}</td>
+  <td style="color:{col};font-weight:700;font-family:monospace" id="vpnl_{t['symbol']}">{fi(pnl,True)}</td>
+  <td><span class="ppct {'pos' if pct>=0 else 'neg'}" id="vpct_{t['symbol']}">{pct:+.2f}%</span></td>
+  <td style="font-family:monospace;font-size:11px;color:#FF4757">₹{float(t.get('sl_price',0)):.2f}</td>
+  <td style="font-family:monospace;font-size:11px;color:#00C896">₹{float(t.get('target1',0)):.2f}</td>
+  <td style="font-family:monospace;font-size:11px">{t.get('score',0)}/8</td>
+  <td>{'<span style="color:#F59E0B;font-size:11px">T1 HIT</span>' if t.get('t1_hit') else f'<span style="color:#00C896;font-size:11px">HOLD · {hd}d</span>'}</td>
+</tr>"""
+    return rows
+
+def _build_vcp_closed_rows(trades):
+    rows = ""
+    for t in trades[:15]:
+        pnl = float(t.get("pnl",0)); pct = float(t.get("pnl_pct",0))
+        col = "#00C896" if pnl>=0 else "#FF4757"
+        r2  = t.get("exit_reason","")
+        icon= "🛑" if "Stop" in r2 else ("🔄" if "Trail" in r2 else ("🎯" if "Target" in r2 else "⏰"))
+        rows += f"""<tr class="cr">
+  <td><span class="stag">{t['symbol']}</span></td>
+  <td class="mc">{t.get('entry_date','')}</td><td class="mc">{t.get('exit_date','')}</td>
+  <td class="mc">₹{float(t['entry_price']):.2f}</td>
+  <td class="mc">₹{float(t.get('exit_price',0)):.2f}</td>
+  <td style="color:{col};font-weight:700">{fi(pnl,True)}</td>
+  <td style="color:{col};font-weight:700">{pct:+.1f}%</td>
+  <td class="mc" style="font-size:10px">{icon} {r2[:28]}</td>
+</tr>"""
+    return rows
+
 def build():
     now=datetime.now(IST)
     trades=sup("p15_trades"); cr=sup("p15_capital")
@@ -164,6 +302,8 @@ def build():
 
     # MA Strategy
     ma_all    = fetch_ma_trades()
+    # VCP Strategy
+    vcp = fetch_vcp_data()
     ma_open   = [t for t in ma_all if t.get("status")=="OPEN"]
     ma_closed = [t for t in ma_all if t.get("status")=="CLOSED"]
     ma_enriched=[]; ma_total_unreal=0
@@ -439,6 +579,33 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
   .hdr{{padding-top:env(safe-area-inset-top)}}
   body{{padding-bottom:env(safe-area-inset-bottom)}}
 }}
+
+/* ══ VCP MODULE ══════════════════════════════════════════════════════════════ */
+.vcp-module{{background:var(--s1);border:1px solid var(--bdr);border-radius:var(--r);overflow:hidden;margin:0}}
+.vcp-module-hdr{{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 16px;cursor:pointer;user-select:none;
+  background:var(--s2);border-bottom:1px solid var(--bdr);
+  transition:background 0.2s;
+}}
+.vcp-module-hdr:hover{{background:var(--s3)}}
+.vcp-mod-title{{font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:1.5px;color:#4A9EFF}}
+.vcp-kbadge{{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;padding:3px 9px;border-radius:6px;background:var(--s3);border:1px solid var(--bdr)}}
+.vcp-chevron{{font-size:18px;color:var(--mut);transition:transform 0.35s ease;flex-shrink:0}}
+.vcp-module.collapsed .vcp-chevron{{transform:rotate(-90deg)}}
+.vcp-module-body{{overflow:hidden;transition:max-height 0.5s cubic-bezier(0.4,0,0.2,1),opacity 0.3s;max-height:4000px;opacity:1;display:flex;flex-direction:column;gap:12px;padding:14px 0}}
+.vcp-module.collapsed .vcp-module-body{{max-height:0;opacity:0;padding:0}}
+.vcp-kpi-row{{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;padding:0 16px}}
+.vcp-kpi{{background:var(--s2);border:1px solid var(--bdr);border-radius:10px;padding:10px 12px}}
+.vcp-kpi-l{{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px}}
+.vcp-kpi-v{{font-family:'Bebas Neue',sans-serif;font-size:20px;letter-spacing:0.5px}}
+.vcp-cards-wrap{{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;padding:0 16px}}
+.vcp-sig-card{{background:var(--s2);border:1px solid var(--bdr);border-radius:12px;padding:14px;transition:border-color 0.2s,transform 0.2s}}
+.vcp-sig-card:hover{{border-color:var(--bdr2);transform:translateY(-2px)}}
+@media(max-width:768px){{
+  .vcp-cards-wrap{{grid-template-columns:1fr}}
+  .vcp-module-body{{gap:10px}}
+}}
 </style>
 </head>
 <body>
@@ -586,6 +753,89 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
           <tbody>{cr2}</tbody>
         </table></div>
       </div>''' if cl else ''}
+
+      <!-- ══ VCP STRATEGY COLLAPSIBLE ══════════════════════════════════════ -->
+      <div class="vcp-module" id="vcpModule">
+        <div class="vcp-module-hdr" onclick="toggleVCP()">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,rgba(74,158,255,0.2),rgba(155,109,255,0.2));border:1px solid rgba(74,158,255,0.3);display:flex;align-items:center;justify-content:center;font-size:16px">📐</div>
+            <div>
+              <div class="vcp-mod-title">VCP STRATEGY</div>
+              <div style="font-size:11px;color:var(--sub);font-family:'JetBrains Mono',monospace">Volatility Contraction · Equity + MCX · Paper Trading</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span class="vcp-kbadge" style="color:{'#00C896' if vcp['total_pnl']>=0 else '#FF4757'}">{fi(vcp['total_pnl'],True)}</span>
+            <span class="vcp-kbadge" style="color:#4A9EFF">{len(vcp['eq_sigs'])} signals</span>
+            <span class="vcp-kbadge" style="color:#9B6DFF">{len(vcp['open'])} open</span>
+            <span class="vcp-chevron" id="vcpChevron">▾</span>
+          </div>
+        </div>
+        <div class="vcp-module-body" id="vcpBody">
+
+          <!-- KPI Row -->
+          <div class="vcp-kpi-row">
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Total P&L</div><div class="vcp-kpi-v" style="color:{'#00C896' if vcp['total_pnl']>=0 else '#FF4757'}">{fi(vcp['total_pnl'],True)}</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Available</div><div class="vcp-kpi-v" style="color:#4A9EFF">{fi(float(vcp['cap']['available']))}</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Invested</div><div class="vcp-kpi-v" style="color:#F5A623">{fi(float(vcp['cap']['invested']))}</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Win Rate</div><div class="vcp-kpi-v" style="color:#9B6DFF">{vcp['wr']:.0f}%</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Trades</div><div class="vcp-kpi-v" style="color:#00D4FF">{vcp['cap']['total_trades']}</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Unrealised</div><div class="vcp-kpi-v" id="vcp-unreal" style="color:{'#00C896' if vcp['live_unreal']>=0 else '#FF4757'}">{fi(vcp['live_unreal'],True)}</div></div>
+            <div class="vcp-kpi"><div class="vcp-kpi-l">Scanner</div><div class="vcp-kpi-v" style="font-size:11px">{'🟢 ON' if vcp['scanner_on'] else '🔴 OFF'}</div></div>
+          </div>
+
+          <!-- Signal Cards -->
+          <div style="padding:0 16px 4px;font-size:9px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1.5px;font-family:'JetBrains Mono',monospace">
+            Today's Signals — {len(vcp['eq_sigs'])} Equity · {len(vcp['com_sigs'])} Commodity
+          </div>
+          <div class="vcp-cards-wrap">
+            {_build_vcp_signal_cards(vcp['eq_sigs'], vcp['com_sigs'], vcp['scanner_on'])}
+          </div>
+
+          <!-- Open Trades -->
+          <div class="card" style="margin:0 16px">
+            <div class="card-hdr">
+              <div class="card-title">VCP Open Trades</div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <div class="upd-dot"></div>
+                <div class="badge" style="color:#4A9EFF;border-color:rgba(74,158,255,0.3);background:rgba(74,158,255,0.08)">{len(vcp['open'])} OPEN</div>
+              </div>
+            </div>
+            {f'''<div style="overflow-x:auto"><table class="pos-table" style="min-width:650px">
+              <thead><tr><th>Symbol</th><th>Date</th><th>Entry</th><th>CMP <span style="color:#00C896;font-size:8px">●LIVE</span></th><th>P&L</th><th>Ret%</th><th>SL</th><th>T1</th><th>Score</th><th>Status</th></tr></thead>
+              <tbody>{_build_vcp_open_rows(vcp['open'])}</tbody>
+            </table></div>''' if vcp['open'] else '<div class="empty" style="padding:24px"><div style="font-size:24px">📂</div><div>No open VCP trades</div><div style="font-size:11px;color:var(--sub)">Breakout signals auto-open paper trades via vcp_scanner.py</div></div>'}
+          </div>
+
+          <!-- Closed Trades + P&L Curve -->
+          <div style="display:grid;grid-template-columns:200px 1fr;gap:12px;margin:0 16px">
+            <div class="cc">
+              <div class="ctitle">VCP Curve</div>
+              <div class="cw"><canvas id="vcpChart"></canvas></div>
+            </div>
+            <div class="card">
+              <div class="card-hdr"><div class="card-title">VCP History</div><div class="badge">LAST {min(15,len(vcp['closed']))}</div></div>
+              {f'''<div style="overflow-x:auto"><table class="ct" style="min-width:550px">
+                <thead><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>Buy</th><th>Sell</th><th>P&L</th><th>Ret%</th><th>Reason</th></tr></thead>
+                <tbody>{_build_vcp_closed_rows(vcp['closed'])}</tbody>
+              </table></div>''' if vcp['closed'] else '<div class="empty" style="padding:24px"><div>No closed trades yet</div></div>'}
+            </div>
+          </div>
+
+          <!-- Universe -->
+          <div style="margin:0 16px 16px;padding:12px 14px;background:var(--s2);border:1px solid var(--bdr);border-radius:10px">
+            <div style="font-size:9px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:8px">Equity Universe · 20 Stocks</div>
+            <div style="display:flex;flex-wrap:wrap;gap:5px">{''.join([f'<span style="font-size:10px;padding:2px 7px;border-radius:4px;background:var(--s3);color:var(--sub);font-family:monospace;border:1px solid var(--bdr)">{s}</span>' for s in VCP_EQ_STOCKS])}</div>
+            <div style="font-size:9px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin:8px 0 6px">MCX Commodity Universe · Options</div>
+            <div style="display:flex;gap:6px">
+              <span style="font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(168,85,247,0.1);color:#A855F7;font-family:monospace;border:1px solid rgba(168,85,247,0.2)">GOLD</span>
+              <span style="font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(168,85,247,0.1);color:#A855F7;font-family:monospace;border:1px solid rgba(168,85,247,0.2)">SILVER</span>
+              <span style="font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(168,85,247,0.1);color:#A855F7;font-family:monospace;border:1px solid rgba(168,85,247,0.2)">CRUDE OIL</span>
+            </div>
+          </div>
+
+        </div><!-- /vcpBody -->
+      </div><!-- /vcpModule -->
 
     <!-- MA_TAB_INJECT -->
     </div>
@@ -769,9 +1019,63 @@ if(WR>=95){{
   }},i*40);
 }}
 
-// PWA install prompt
-let deferredPrompt;
-window.addEventListener('beforeinstallprompt',e=>{{deferredPrompt=e}});
+// VCP Module toggle
+function toggleVCP(){{
+  const m=document.getElementById('vcpModule');
+  m.classList.toggle('collapsed');
+  localStorage.setItem('vcpOpen', !m.classList.contains('collapsed'));
+}}
+(()=>{{
+  const open=localStorage.getItem('vcpOpen');
+  if(open==='false') document.getElementById('vcpModule').classList.add('collapsed');
+}})();
+
+// VCP P&L Chart
+const VCP_PH={json.dumps(vcp['ph'])};
+const vcpLc=document.getElementById('vcpChart');
+if(vcpLc&&VCP_PH.length>0){{
+  const isP=VCP_PH[VCP_PH.length-1]>=0;
+  const vg=vcpLc.getContext('2d').createLinearGradient(0,0,0,140);
+  isP?(vg.addColorStop(0,'rgba(74,158,255,0.25)'),vg.addColorStop(1,'rgba(74,158,255,0)'))
+     :(vg.addColorStop(0,'rgba(255,71,87,0.25)'),vg.addColorStop(1,'rgba(255,71,87,0)'));
+  new Chart(vcpLc,{{type:'line',data:{{
+    labels:VCP_PH.map((_,i)=>'T'+(i+1)),
+    datasets:[{{data:VCP_PH,borderColor:isP?'#4A9EFF':'#FF4757',backgroundColor:vg,
+      fill:true,tension:0.45,pointRadius:VCP_PH.length>15?0:3,pointHoverRadius:6,
+      pointBackgroundColor:isP?'#4A9EFF':'#FF4757',pointBorderColor:'#020408',
+      pointBorderWidth:2,borderWidth:2}}]
+  }},options:{{responsive:true,maintainAspectRatio:false,
+    plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>' '+fi(c.raw,true)}},
+      backgroundColor:'#080D18',borderColor:'rgba(74,158,255,0.3)',borderWidth:1,
+      titleColor:'#4A9EFF',bodyColor:'#E8F0FF',padding:8,cornerRadius:8}}}},
+    scales:{{x:{{ticks:{{color:'#3D4F6A',maxTicksLimit:5}},grid:{{color:'rgba(255,255,255,0.03)'}}}},
+             y:{{ticks:{{color:'#3D4F6A',callback:v=>fi(v)}},grid:{{color:'rgba(255,255,255,0.04)'}}}}}}
+  }}}});
+}}
+
+// VCP open trades live CMP
+const VCP_OPEN={json.dumps([{{"sym":t["symbol"],"entry":float(t["entry_price"]),"qty":t["quantity"]}} for t in vcp['open']])};
+async function refreshVCP(){{
+  let unreal=0;
+  for(const t of VCP_OPEN){{
+    try{{
+      const r=await fetch('https://query1.finance.yahoo.com/v8/finance/chart/'+t.sym+'.NS',{{headers:{{'User-Agent':'Mozilla/5.0'}}}});
+      const m=(await r.json()).chart.result[0].meta;
+      const cmp=parseFloat(m.regularMarketPrice);
+      const pnl=(cmp-t.entry)*t.qty; const pct=(cmp-t.entry)/t.entry*100;
+      unreal+=pnl;
+      const ce=document.getElementById('vcmp_'+t.sym);
+      const pe=document.getElementById('vpnl_'+t.sym);
+      const pce=document.getElementById('vpct_'+t.sym);
+      if(ce)ce.textContent='₹'+cmp.toFixed(2);
+      if(pe){{pe.textContent=fi(pnl,true);pe.style.color=pnl>=0?'var(--green)':'var(--red)';}}
+      if(pce){{pce.textContent=pct.toFixed(2)+'%';pce.className='ppct '+(pct>=0?'pos':'neg');}}
+    }}catch(e){{}}
+  }}
+  const ue=document.getElementById('vcp-unreal');
+  if(ue){{ue.textContent=fi(unreal,true);ue.style.color=unreal>=0?'var(--green)':'var(--red)';}}
+}}
+if(VCP_OPEN.length>0){{refreshVCP();setInterval(refreshVCP,15000);}}
 
 // MA Strategy
 const MA_EQ={ma_eq_js};
@@ -834,6 +1138,8 @@ function showTab(tab,btn){{
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path=self.path.split('?')[0]
+        if path in ('/health','/ping','/favicon.ico'):
+            self.send_response(200); self.send_header("Content-type","text/plain"); self.end_headers(); self.wfile.write(b"OK"); return
         if path=='/manifest.json':
             manifest=json.dumps({{
                 "name":"Power 15 Terminal","short_name":"Power15",

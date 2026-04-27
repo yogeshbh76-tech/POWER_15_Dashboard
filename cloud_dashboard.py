@@ -93,8 +93,12 @@ def build():
         ton=pkp>=cfg["t"] and cfg["tr"]>0
         ts=round(pk*(1-cfg["tr"]/100),2) if ton else None
         tu+=pnl
+        t1_price = round(t["entry_price"] * 1.20, 2)  # +20% T1
+        t2_price = round(t["entry_price"] * 1.30, 2)  # +30% T2
+        t1_hit   = t.get("t1_hit", False)
         en.append({**t,"cmp":p,"pnl":pnl,"pct":pct,"days":d,"left":lf,"peak":pk,"pkp":pkp,
-                   "tier":tier,"ton":ton,"ts":ts,"sector":SECTORS.get(t["symbol"],"Other")})
+                   "tier":tier,"ton":ton,"ts":ts,"sector":SECTORS.get(t["symbol"],"Other"),
+                   "t1_price":t1_price,"t2_price":t2_price,"t1_hit":t1_hit})
     tp=cap["total_pnl"]+tu; tr=tp/cap["initial"]*100 if cap["initial"]>0 else 0
     wr=cap["winning_trades"]/cap["total_trades"]*100 if cap["total_trades"]>0 else 0
     ip=min(100,cap["invested"]/cap["initial"]*100) if cap["initial"]>0 else 0
@@ -112,7 +116,8 @@ def build():
     td=json.dumps([{"sym":t["symbol"],"entry":t["entry_price"],"qty":t["quantity"],
                     "sl":t["sl_price"],"peak":t["peak"],"days":t["days"],"left":t["left"],
                     "pkp":round(t["pkp"],1),"ton":t["ton"],"ts":t["ts"],
-                    "tier":t["tier"],"sector":t["sector"]} for t in en])
+                    "tier":t["tier"],"sector":t["sector"],
+                    "t1":t["t1_price"],"t2":t["t2_price"],"t1_hit":t["t1_hit"]} for t in en])
     # closed rows
     cr2=""
     for t in sorted(cl,key=lambda x:x.get("exit_date","0"),reverse=True)[:15]:
@@ -149,10 +154,12 @@ def build():
   <div class="mcard-detail">
     <div class="mdet"><span>Entry</span><b>₹{t["entry_price"]:.2f}</b></div>
     <div class="mdet"><span>CMP</span><b id="mdcmp_{t['symbol']}">₹{t['cmp']:.2f}</b></div>
-    <div class="mdet"><span>SL</span><b style="color:#EF4444">₹{t["sl_price"]:.2f}</b></div>
+    <div class="mdet"><span>🛑 SL (-8%)</span><b style="color:#EF4444">₹{t["sl_price"]:.2f}</b></div>
+    <div class="mdet"><span>🎯 T1 (+20%)</span><b style="color:{'#10B981' if t['t1_hit'] else '#F59E0B'}">₹{t['t1_price']:.2f}{'  ✅' if t['t1_hit'] else ''}</b></div>
+    <div class="mdet"><span>🏆 T2 (+30%)</span><b style="color:#00D4FF">₹{t['t2_price']:.2f}</b></div>
     <div class="mdet"><span>Peak</span><b style="color:#F59E0B">₹{t["peak"]:.2f}</b></div>
     <div class="mdet"><span>Invested</span><b>{fi(t["entry_price"]*t["quantity"])}</b></div>
-    <div class="mdet"><span>Trail at</span><b>{HYBRID.get(t["symbol"],{}).get("t",80)}%</b></div>
+    <div class="mdet"><span>Days / Left</span><b>{t["days"]}d / {t["left"]}d</b></div>
   </div>
 </div>"""
     # ticker
@@ -548,7 +555,10 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
               <th>Symbol</th><th>Entry</th>
               <th>CMP <span style="color:var(--green);font-size:8px">● LIVE</span></th>
               <th>P&L ₹</th><th>Return</th><th>Peak</th>
-              <th>Stop Loss</th><th>Days</th><th>Status</th>
+              <th>🛑 Stop Loss</th>
+              <th>🎯 T1 +20%</th>
+              <th>🏆 T2 +30%</th>
+              <th>Days</th><th>Status</th>
             </tr></thead>
             <tbody id="posBody">
               {''.join([f"""<tr class="pos-row" id="row_{t['symbol']}">
@@ -559,6 +569,8 @@ table{{width:100%;border-collapse:collapse;min-width:700px}}
                 <td><span class="ppct {'pos' if t['pct']>=0 else 'neg'}" id="pct_{t['symbol']}">{t['pct']:+.2f}%</span></td>
                 <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--gold)" id="pk_{t['symbol']}">₹{t['peak']:.2f} <span style="font-size:9px;color:var(--sub)">(+{t['pkp']:.1f}%)</span></td>
                 <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--red)">₹{t['sl_price']:.2f}</td>
+                <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{'var(--green)' if t['pct']>=20 else 'var(--gold)'}">₹{t['t1_price']:.2f}{'  ✅' if t['t1_hit'] else ''}</td>
+                <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{'var(--green)' if t['pct']>=30 else 'var(--cyan)'}">₹{t['t2_price']:.2f}</td>
                 <td><div class="pmini"><div class="pmini-f" style="width:{min(100,t['days']/90*100):.0f}%;background:{'#FF4757' if t['left']<=10 else '#F5A623' if t['left']<=30 else '#00C896'}"></div></div><div style="font-size:9px;color:var(--sub);font-family:'JetBrains Mono',monospace;margin-top:3px">{t['days']}d left {t['left']}d</div></td>
                 <td id="st_{t['symbol']}">{f'<span class="trail-t">🔄 TRAIL</span>' if t['ton'] else ('<span style="color:var(--red);font-size:11px;font-weight:700">EXIT</span>' if t['days']>=90 or t['cmp']<=t['sl_price'] else ('<span style="color:var(--gold);font-size:11px">WATCH</span>' if t['left']<=10 else '<span style="color:var(--green);font-size:11px">HOLD</span>'))}</td>
               </tr>""" for t in en])}
@@ -711,13 +723,13 @@ async function refreshPrices(){{
       if(tc){{tc.textContent=dayChg.toFixed(2)+'%';tc.style.color=dayChg>=0?'#00C896':'#FF4757';}}
       if(tp2){{tp2.textContent=fi(pnl,true);tp2.style.color=pnl>=0?'#00C896':'#FF4757';}}
 
-      // Status
       const st=document.getElementById(`st_${{t.sym}}`);
       if(st){{
-        const pp=(t.peak-t.entry)/t.entry*100;
-        if(t.ton&&pp>=(t.t||80))st.innerHTML='<span class="trail-t">🔄 TRAIL</span>';
-        else if(pnlPct>=80)st.innerHTML='<span style="color:var(--gold);font-size:11px;font-weight:700">🎯 TARGET</span>';
-        else if(cmp<=t.sl)st.innerHTML='<span style="color:var(--red);font-size:11px;font-weight:700">🛑 SL</span>';
+        const pct=(cmp-t.entry)/t.entry*100;
+        if(cmp<=t.sl)st.innerHTML='<span style="color:var(--red);font-size:11px;font-weight:700">🛑 SL HIT</span>';
+        else if(pct>=30)st.innerHTML='<span style="color:var(--cyan);font-size:11px;font-weight:700">🏆 T2 HIT</span>';
+        else if(pct>=20||t.t1_hit)st.innerHTML='<span style="color:var(--green);font-size:11px;font-weight:700">🎯 T1 HIT</span>';
+        else if(pct>=10)st.innerHTML='<span style="color:var(--gold);font-size:11px">📈 NEAR T1</span>';
         else if(t.left<=10)st.innerHTML='<span style="color:var(--gold);font-size:11px">⚠ WATCH</span>';
         else st.innerHTML='<span style="color:var(--green);font-size:11px">HOLD</span>';
       }}

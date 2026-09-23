@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Power 15 — Live Dashboard</title>
+<style>
+  :root{
+    --surface-1:  #1a1a19;
+    --page:       #0d0d0d;
+    --text-1:     #ffffff;
+    --text-2:     #c3c2b7;
+    --muted:      #898781;
+    --grid:       #2c2c2a;
+    --baseline:   #383835;
+    --border:     rgba(255,255,255,0.10);
+    --good:       #0ca30c;
+    --critical:   #e66767;
+    --warning:    #c98500;
+    --series-1:   #3987e5;
+    --sec-metals:   #d95926;
+    --sec-psu:      #3987e5;
+    --sec-fin:      #9085e9;
+    --sec-priv:     #199e70;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--page); color:var(--text-1);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
+  .topbar{
+    display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;
+    padding:14px 18px;background:var(--surface-1);border:1px solid var(--border);border-radius:12px;margin-bottom:18px;
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--good)}
+  .meta{display:flex;flex-wrap:wrap;gap:18px;font-size:13px;color:var(--text-2)}
+  .meta b{color:var(--text-1)}
+  .pill{padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.02em}
+  .pill.open{background:rgba(12,163,12,0.16);color:var(--good)}
+  .pill.closed{background:rgba(230,103,103,0.16);color:var(--critical)}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+  .stat{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+  .stat .lbl{font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+  .stat .val{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+  .stat .sub{font-size:12px;margin-top:4px;color:var(--text-2)}
+
+  section{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:18px}
+  section h2{margin:0 0 12px;font-size:15px;color:var(--text-2);text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap}
+  td{padding:8px 10px;border-bottom:1px solid var(--grid);white-space:nowrap;font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:none}
+  .tbl-scroll{overflow-x:auto}
+  .sym{font-weight:700}
+  .sec-tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;color:#0d0d0d}
+  .up{color:var(--good);font-weight:700}
+  .down{color:var(--critical);font-weight:700}
+  .empty{color:var(--muted);font-size:13px;padding:12px 0}
+
+  .sector-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:13px}
+  .sector-row .name{width:130px;color:var(--text-2);flex-shrink:0}
+  .sector-row .bar-track{flex:1;height:10px;background:var(--grid);border-radius:6px;overflow:hidden}
+  .sector-row .bar-fill{height:100%;border-radius:6px}
+  .sector-row .amt{width:90px;text-align:right;font-variant-numeric:tabular-nums;flex-shrink:0}
+
+  .chart-wrap{width:100%;overflow-x:auto}
+  svg text{fill:var(--muted);font-size:10px}
+
+  footer{text-align:center;color:var(--muted);font-size:12px;margin-top:24px}
+  .note{font-size:12px;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand"><span class="dot" id="marketDot"></span> Power 15 — Live Dashboard</div>
+    <div class="meta">
+      <span id="marketStatus"><b>—</b></span>
+      <span>Nifty 50: <b id="niftyVal">—</b></span>
+      <span>Updated: <b id="lastUpdated">—</b></span>
+    </div>
+  </div>
+
+  <div class="stats" id="statTiles"></div>
+
+  <section>
+    <h2>Open Positions</h2>
+    <div class="tbl-scroll">
+      <table id="openTable">
+        <thead><tr>
+          <th>Symbol</th><th>Sector</th><th>Entry</th><th>CMP</th><th>P&amp;L</th><th>P&amp;L %</th>
+          <th>SL (-8%)</th><th>T1 (+20%)</th><th>T2 (+30%)</th><th>Peak</th><th>Days</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="openEmpty" style="display:none">No open positions.</div>
+  </section>
+
+  <section>
+    <h2>Equity Curve — Realized P&amp;L</h2>
+    <div class="chart-wrap"><svg id="equitySvg" width="100%" height="180" viewBox="0 0 900 180" preserveAspectRatio="none"></svg></div>
+  </section>
+
+  <section>
+    <h2>Sector Allocation</h2>
+    <div id="sectorAlloc"></div>
+  </section>
+
+  <section>
+    <h2>Closed Trades <span class="note">(most recent 15)</span></h2>
+    <div class="tbl-scroll">
+      <table id="closedTable">
+        <thead><tr>
+          <th>Symbol</th><th>Entry Date</th><th>Exit Date</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>P&amp;L %</th><th>Reason</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="closedEmpty" style="display:none">No closed trades yet.</div>
+  </section>
+
+  <section>
+    <h2>MA Strategy — Today</h2>
+    <div class="note" style="margin-bottom:10px">Live CMP for this strategy isn't synced yet — open positions show entry data only; closed trades show realized P&amp;L.</div>
+    <div class="tbl-scroll">
+      <table id="maTable">
+        <thead><tr><th>Symbol</th><th>Status</th><th>Entry</th><th>Qty</th><th>Exit</th><th>P&amp;L</th><th>P&amp;L %</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="maEmpty" style="display:none">No MA strategy trades today.</div>
+  </section>
+
+  <footer>
+    Data refreshes from Supabase every 2 minutes · Prices sync once daily via the 4:00&nbsp;PM IST bot run
+  </footer>
+
+</div>
+
+<script>
+const SUPABASE_URL = "https://xlrbmsmrgosqbioojqfz.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhscmJtc21yZ29zcWJpb29qcWZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNTk2ODYsImV4cCI6MjA4ODczNTY4Nn0.FDMG6lKMXtMpESj3bEH1HbyTrJyPbn-Tn0WitMkLxiM";
+const HDRS = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` };
+
+const SECTOR_COLOR = {
+  "Metals & Mining": "var(--sec-metals)",
+  "PSU Bank":        "var(--sec-psu)",
+  "Financials":      "var(--sec-fin)",
+  "Private Bank":    "var(--sec-priv)",
+};
+
+async function supa(table, query="") {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, { headers: HDRS });
+    if (!r.ok) return [];
+    return await r.json();
+  } catch { return []; }
+}
+
+function fmtMoney(v, signed=false) {
+  const sign = signed ? (v >= 0 ? "+" : "-") : (v < 0 ? "-" : "");
+  v = Math.abs(v || 0);
+  let s;
+  if (v >= 1e7) s = `₹${(v/1e7).toFixed(2)}Cr`;
+  else if (v >= 1e5) s = `₹${(v/1e5).toFixed(1)}L`;
+  else if (v >= 1e3) s = `₹${(v/1e3).toFixed(1)}K`;
+  else s = `₹${v.toFixed(0)}`;
+  return sign + s;
+}
+function pctClass(v){ return v >= 0 ? "up" : "down"; }
+
+function marketState() {
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const day = now.getDay(), h = now.getHours(), m = now.getMinutes();
+  const mins = h*60+m;
+  const open = day >= 1 && day <= 5 && mins >= 555 && mins <= 930; // 9:15–15:30 IST
+  return { open, weekend: day === 0 || day === 6 };
+}
+
+function renderStats(cap, openTrades) {
+  const totalPnl = cap.total_pnl || 0;
+  const wr = cap.total_trades > 0 ? (cap.winning_trades / cap.total_trades * 100) : 0;
+  const tiles = [
+    ["Initial Capital", fmtMoney(cap.initial)],
+    ["Available", fmtMoney(cap.available)],
+    ["Invested", fmtMoney(cap.invested)],
+    ["Total P&L", fmtMoney(totalPnl, true), totalPnl >= 0 ? "up" : "down"],
+    ["Win Rate", `${wr.toFixed(0)}%`, null, `${cap.winning_trades||0}/${cap.total_trades||0} trades`],
+    ["Open Positions", String(openTrades.length)],
+  ];
+  document.getElementById("statTiles").innerHTML = tiles.map(([lbl,val,cls,sub]) => `
+    <div class="stat">
+      <div class="lbl">${lbl}</div>
+      <div class="val ${cls||''}">${val}</div>
+      ${sub ? `<div class="sub">${sub}</div>` : ''}
+    </div>`).join("");
+}
+
+function renderOpen(trades) {
+  const tbody = document.querySelector("#openTable tbody");
+  const empty = document.getElementById("openEmpty");
+  if (!trades.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = trades.map(t => {
+    const entry = t.entry_price, cmp = t.cmp || entry;
+    const pnl = (cmp - entry) * t.quantity;
+    const pct = (cmp - entry) / entry * 100;
+    const t1 = entry * 1.20, t2 = entry * 1.30;
+    const days = t.entry_date ? Math.floor((Date.now() - new Date(t.entry_date)) / 86400000) : 0;
+    const secColor = SECTOR_COLOR[t.sector] || "#94A3B8";
+    return `<tr>
+      <td class="sym">${t.symbol}</td>
+      <td><span class="sec-tag" style="background:${secColor}">${t.sector||"—"}</span></td>
+      <td>₹${entry.toFixed(2)}</td>
+      <td>₹${cmp.toFixed(2)}</td>
+      <td class="${pctClass(pnl)}">${fmtMoney(pnl,true)}</td>
+      <td class="${pctClass(pct)}">${pct>=0?'+':''}${pct.toFixed(1)}%</td>
+      <td>₹${t.sl_price.toFixed(2)}</td>
+      <td>₹${t1.toFixed(2)}${t.t1_hit?' ✓':''}</td>
+      <td>₹${t2.toFixed(2)}</td>
+      <td>₹${(t.peak_cmp||entry).toFixed(2)}</td>
+      <td>${days}d</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderClosed(trades) {
+  const tbody = document.querySelector("#closedTable tbody");
+  const empty = document.getElementById("closedEmpty");
+  const sorted = [...trades].sort((a,b) => (b.exit_date||"").localeCompare(a.exit_date||"")).slice(0,15);
+  if (!sorted.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = sorted.map(t => `
+    <tr>
+      <td class="sym">${t.symbol}</td>
+      <td>${t.entry_date||""}</td>
+      <td>${t.exit_date||""}</td>
+      <td>₹${t.entry_price.toFixed(2)}</td>
+      <td>₹${(t.exit_price||0).toFixed(2)}</td>
+      <td class="${pctClass(t.pnl||0)}">${fmtMoney(t.pnl||0,true)}</td>
+      <td class="${pctClass(t.pnl_pct||0)}">${(t.pnl_pct||0)>=0?'+':''}${(t.pnl_pct||0).toFixed(1)}%</td>
+      <td style="white-space:normal;font-size:12px">${t.exit_reason||""}</td>
+    </tr>`).join("");
+}
+
+function renderSectorAlloc(openTrades) {
+  const bySector = {};
+  let total = 0;
+  openTrades.forEach(t => {
+    const val = t.entry_price * t.quantity;
+    bySector[t.sector||"Other"] = (bySector[t.sector||"Other"]||0) + val;
+    total += val;
+  });
+  const el = document.getElementById("sectorAlloc");
+  const entries = Object.entries(bySector);
+  if (!entries.length) { el.innerHTML = '<div class="empty">No open positions.</div>'; return; }
+  el.innerHTML = entries.map(([sec,val]) => {
+    const pct = total > 0 ? (val/total*100) : 0;
+    const color = SECTOR_COLOR[sec] || "#94A3B8";
+    return `<div class="sector-row">
+      <div class="name">${sec}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div></div>
+      <div class="amt">${fmtMoney(val)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderEquityCurve(closedTrades) {
+  const svg = document.getElementById("equitySvg");
+  const sorted = [...closedTrades].sort((a,b) => (a.exit_date||"").localeCompare(b.exit_date||""));
+  let run = 0;
+  const pts = [0, ...sorted.map(t => (run += (t.pnl||0)))];
+  const W = 900, H = 180, pad = 10;
+  const min = Math.min(0, ...pts), max = Math.max(0, ...pts);
+  const range = (max - min) || 1;
+  const x = i => pad + i * (W - 2*pad) / Math.max(1, pts.length - 1);
+  const y = v => H - pad - ((v - min) / range) * (H - 2*pad);
+  const linePath = pts.map((v,i) => `${i===0?'M':'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const areaPath = `${linePath} L${x(pts.length-1).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+  svg.innerHTML = `
+    <line x1="${pad}" y1="${y(0).toFixed(1)}" x2="${W-pad}" y2="${y(0).toFixed(1)}" stroke="var(--baseline)" stroke-width="1"/>
+    <path d="${areaPath}" fill="var(--series-1)" opacity="0.12"/>
+    <path d="${linePath}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  `;
+}
+
+function renderMA(trades) {
+  const tbody = document.querySelector("#maTable tbody");
+  const empty = document.getElementById("maEmpty");
+  if (!trades.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = trades.map(t => {
+    const closed = t.status === "CLOSED";
+    const pnl = closed ? (t.exit_price - t.entry_price) * t.quantity : null;
+    const pct = closed ? (t.exit_price - t.entry_price) / t.entry_price * 100 : null;
+    return `<tr>
+      <td class="sym">${t.symbol}</td>
+      <td><span class="pill ${closed?'closed':'open'}">${t.status}</span></td>
+      <td>₹${t.entry_price.toFixed(2)}</td>
+      <td>${t.quantity}</td>
+      <td>${closed ? '₹'+t.exit_price.toFixed(2) : '—'}</td>
+      <td class="${pnl===null?'':pctClass(pnl)}">${pnl===null?'—':fmtMoney(pnl,true)}</td>
+      <td class="${pct===null?'':pctClass(pct)}">${pct===null?'—':(pct>=0?'+':'')+pct.toFixed(1)+'%'}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadAll() {
+  const [trades, capRows, maTrades] = await Promise.all([
+    supa("p15_trades", "select=*"),
+    supa("p15_capital", "select=*"),
+    supa("ma_trades", `trade_date=eq.${new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Kolkata"})}&select=*`),
+  ]);
+  const cap = capRows[0] || { initial:500000, available:500000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
+  const open = trades.filter(t => t.status === "OPEN");
+  const closed = trades.filter(t => t.status === "CLOSED");
+
+  renderStats(cap, open);
+  renderOpen(open);
+  renderClosed(closed);
+  renderSectorAlloc(open);
+  renderEquityCurve(closed);
+  renderMA(maTrades);
+
+  const ms = marketState();
+  document.getElementById("marketDot").style.background = ms.open ? "var(--good)" : "var(--critical)";
+  document.getElementById("marketStatus").innerHTML = `<b>${ms.open ? "MARKET OPEN" : ms.weekend ? "WEEKEND" : "MARKET CLOSED"}</b>`;
+  if (cap.nifty_price) {
+    const chg = cap.nifty_change_pct || 0;
+    document.getElementById("niftyVal").innerHTML = `<span class="${pctClass(chg)}">${cap.nifty_price.toLocaleString("en-IN")} (${chg>=0?'+':''}${chg.toFixed(2)}%)</span>`;
+  }
+  if (cap.updated_at) {
+    document.getElementById("lastUpdated").textContent = new Date(cap.updated_at).toLocaleString("en-IN", { timeZone:"Asia/Kolkata", dateStyle:"medium", timeStyle:"short" });
+  }
+}
+
+loadAll();
+setInterval(loadAll, 120000);
+</script>
+</body>
+</html>

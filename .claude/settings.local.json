@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls C:/power15_bot/*.bat C:/power15_bot/*.ps1 C:/power15_bot/*.xml C:/power15_bot/*.cmd)"
+    ]
+  }
+}

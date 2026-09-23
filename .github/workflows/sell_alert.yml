@@ -1,0 +1,27 @@
+name: Sell Alert (4:00 PM IST)
+
+on:
+  schedule:
+    - cron: "30 10 * * 1-5"  # 10:30 UTC = 4:00 PM IST, Mon–Fri
+  workflow_dispatch:
+
+jobs:
+  sell:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python sell_alert.py

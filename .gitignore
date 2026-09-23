@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+*.pyc
+trade_log.json
+paper_capital.json
+watchlist.json

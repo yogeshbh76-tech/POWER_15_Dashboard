@@ -1,0 +1,27 @@
+name: MA Strategy Scan (every 15 min, market hours)
+
+on:
+  schedule:
+    - cron: "2,17,32,47 4-9 * * 1-5"   # 04:02-09:47 UTC = 9:32 AM-3:17 PM IST, Mon–Fri
+  workflow_dispatch:
+
+jobs:
+  ma_scan:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python ma_strategy.py

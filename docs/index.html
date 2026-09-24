@@ -128,6 +128,7 @@
 
   <section>
     <h2>MA Strategy — Today</h2>
+    <div id="maCapital" class="stats" style="margin-bottom:14px"></div>
     <div class="note" style="margin-bottom:10px">Live CMP for this strategy isn't synced yet — open positions show entry data only; closed trades show realized P&amp;L.</div>
     <div class="tbl-scroll">
       <table id="maTable">
@@ -291,6 +292,24 @@ function renderEquityCurve(closedTrades) {
   `;
 }
 
+function renderMACapital(cap) {
+  const totalPnl = cap.total_pnl || 0;
+  const wr = cap.total_trades > 0 ? (cap.winning_trades / cap.total_trades * 100) : 0;
+  const tiles = [
+    ["Initial", fmtMoney(cap.initial)],
+    ["Available", fmtMoney(cap.available)],
+    ["Invested", fmtMoney(cap.invested)],
+    ["Total P&L", fmtMoney(totalPnl, true), totalPnl >= 0 ? "up" : "down"],
+    ["Win Rate", `${wr.toFixed(0)}%`, null, `${cap.winning_trades||0}/${cap.total_trades||0} trades`],
+  ];
+  document.getElementById("maCapital").innerHTML = tiles.map(([lbl,val,cls,sub]) => `
+    <div class="stat">
+      <div class="lbl">${lbl}</div>
+      <div class="val ${cls||''}">${val}</div>
+      ${sub ? `<div class="sub">${sub}</div>` : ''}
+    </div>`).join("");
+}
+
 function renderMA(trades) {
   const tbody = document.querySelector("#maTable tbody");
   const empty = document.getElementById("maEmpty");
@@ -313,12 +332,14 @@ function renderMA(trades) {
 }
 
 async function loadAll() {
-  const [trades, capRows, maTrades] = await Promise.all([
+  const [trades, capRows, maTrades, maCapRows] = await Promise.all([
     supa("p15_trades", "select=*"),
     supa("p15_capital", "select=*"),
     supa("ma_trades", `trade_date=eq.${new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Kolkata"})}&select=*`),
+    supa("ma_capital", "select=*"),
   ]);
   const cap = capRows[0] || { initial:500000, available:500000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
+  const maCap = maCapRows[0] || { initial:100000, available:100000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
   const open = trades.filter(t => t.status === "OPEN");
   const closed = trades.filter(t => t.status === "CLOSED");
 
@@ -327,6 +348,7 @@ async function loadAll() {
   renderClosed(closed);
   renderSectorAlloc(open);
   renderEquityCurve(closed);
+  renderMACapital(maCap);
   renderMA(maTrades);
 
   const ms = marketState();

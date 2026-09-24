@@ -233,6 +233,16 @@ def get_open_trades():
     today = date.today().strftime("%Y-%m-%d")
     return supa_get("ma_trades", f"status=eq.OPEN&trade_date=eq.{today}&select=*")
 
+def get_ma_capital():
+    """MA strategy's own capital pool — separate from Power15's and VCP's."""
+    rows = supa_get("ma_capital", "select=*")
+    if rows is None:
+        return None
+    return rows[0] if rows else {
+        "id": 1, "initial": 100000, "available": 100000, "invested": 0,
+        "total_pnl": 0, "total_trades": 0, "winning_trades": 0
+    }
+
 def already_traded_today(symbol):
     """True if this symbol already has a trade (open or closed) today — takes
     the place of the old in-memory alerted_today set, which can't survive
@@ -245,6 +255,16 @@ def already_traded_today(symbol):
     return len(rows) > 0
 
 def open_trade(sig):
+    capital = get_ma_capital()
+    if capital is None:
+        log(f"Supabase unreachable — skipping {sig['symbol']} entry")
+        return None
+
+    cost = round(sig["qty"] * sig["cmp"], 2)
+    if capital["available"] < cost:
+        log(f"Insufficient MA capital for {sig['symbol']} — need Rs{cost:.0f}, have Rs{capital['available']:.0f}")
+        return None
+
     today  = date.today().strftime("%Y-%m-%d")
     now_t  = datetime.now().strftime("%H:%M:%S")
     record = {
@@ -266,12 +286,16 @@ def open_trade(sig):
     result = supa_post("ma_trades", record)
     if result:
         log(f"Trade opened in Supabase: {sig['symbol']}")
+        supa_patch("ma_capital", "id=eq.1", {
+            "available": round(capital["available"] - cost, 2),
+            "invested":  round(capital["invested"] + cost, 2),
+        })
     else:
         log(f"WARNING: Supabase insert may have failed for {sig['symbol']}")
     return result
 
 def close_trade(trade_id, exit_price, reason, entry_price, quantity):
-    """Close a trade and write final PnL to Supabase."""
+    """Close a trade, write final PnL, and settle it against MA's own capital pool."""
     now_t = datetime.now().strftime("%H:%M:%S")
     pnl   = round((exit_price - entry_price) * quantity, 2)
     supa_patch("ma_trades", f"id=eq.{trade_id}", {
@@ -280,6 +304,19 @@ def close_trade(trade_id, exit_price, reason, entry_price, quantity):
         "exit_price":  round(exit_price, 2),
         "exit_reason": reason,
         "pnl":         pnl,
+    })
+
+    capital = get_ma_capital()
+    if capital is None:
+        log("Supabase unreachable — trade closed but capital pool not updated")
+        return
+    cost = round(entry_price * quantity, 2)
+    supa_patch("ma_capital", "id=eq.1", {
+        "available":      round(capital["available"] + cost + pnl, 2),
+        "invested":       round(max(0, capital["invested"] - cost), 2),
+        "total_pnl":      round(capital["total_pnl"] + pnl, 2),
+        "total_trades":   capital["total_trades"] + 1,
+        "winning_trades": capital["winning_trades"] + (1 if pnl > 0 else 0),
     })
 
 def check_exits():
@@ -379,11 +416,13 @@ def run_scan():
             continue
         sig = check_signal(sym)
         if sig and sig["signal"] == "BUY":
-            signals_found += 1
-            slots_free    -= 1
             log(f"BUY signal: {sym} @ Rs{sig['cmp']:.2f}")
 
-            open_trade(sig)
+            if not open_trade(sig):
+                continue  # insufficient capital or Supabase issue — no alert, no slot used
+
+            signals_found += 1
+            slots_free    -= 1
 
             vr_str = f"{sig['vol_ratio']}x" if sig["vol_ratio"] else "n/a"
             tg(

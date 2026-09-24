@@ -16,10 +16,36 @@ from datetime import datetime
 from urllib.request import urlopen, Request
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
-WATCHLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
-CTX       = ssl.create_default_context()
+BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID",   "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://xlrbmsmrgosqbioojqfz.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhscmJtc21yZ29zcWJpb29qcWZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNTk2ODYsImV4cCI6MjA4ODczNTY4Nn0.FDMG6lKMXtMpESj3bEH1HbyTrJyPbn-Tn0WitMkLxiM")
+WATCHLIST    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
+CTX          = ssl.create_default_context()
+
+def save_watchlist_supabase(watchlist):
+    """Upserts today's watchlist to Supabase so buy_check.py can read it the
+    next trading day — GitHub Actions runners don't share a filesystem between
+    separate scheduled jobs, so the local watchlist.json alone never reaches it."""
+    try:
+        url  = f"{SUPABASE_URL}/rest/v1/p15_watchlist?on_conflict=id"
+        body = json.dumps({
+            "id":           1,
+            "trade_date":   watchlist["date"],
+            "nifty_status": watchlist["nifty_status"],
+            "nifty_cmp":    watchlist.get("nifty_cmp"),
+            "symbols":      watchlist["symbols"],
+        }).encode()
+        req = Request(url, data=body, method="POST", headers={
+            "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        })
+        with urlopen(req, timeout=15, context=CTX) as r:
+            return r.status in (200, 201, 204)
+    except Exception as e:
+        print(f"  Watchlist Supabase sync error: {e}")
+        return False
 
 POWER_15 = {
     "NATIONALUM":1,"INDIANB":1,"VEDL":1,"SHRIRAMFIN":1,
@@ -392,9 +418,12 @@ def main():
     }
     try:
         json.dump(watchlist, open(WATCHLIST, "w"), indent=2)
-        print(f"\n  Watchlist saved: {[s['symbol'] for s in approved]}")
+        print(f"\n  Watchlist saved locally: {[s['symbol'] for s in approved]}")
     except Exception as e:
         print(f"  Watchlist save error: {e}")
+
+    ok = save_watchlist_supabase(watchlist)
+    print(f"  Watchlist synced to Supabase: {'✅' if ok else '❌'}")
 
     # Step 5: Telegram message
     nifty_icon = {"STRONG": "G", "CAUTION": "Y", "AVOID": "R", "UNKNOWN": "?"}

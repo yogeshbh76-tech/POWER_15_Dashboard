@@ -1,5 +1,5 @@
 """
-Power 15 — Buy Check v2.0 (Run at 3:25 PM daily)
+Power 15 — Buy Check v2.1 (Run at 3:25 PM daily)
 =================================================
 UPGRADES vs v1:
   #1 Tier-Based Sizing : Tier 1 = ₹20,000 | Tier 2 = ₹15,000 | Tier 3 = ₹10,000
@@ -11,11 +11,16 @@ UPGRADES vs v1:
                          At those times only checks stop losses + trailing stops
                          Full buy logic only at 3:25 PM
 
+v2.1: Trades, capital and the watchlist now live in Supabase instead of local
+JSON files, so this runs the same way from GitHub Actions or a local PC —
+GitHub Actions gives each scheduled run a fresh, disposable filesystem, so a
+local file written by scanner.py could never reach buy_check.py's later run.
+
 Run modes:
   python buy_check.py          → 3:25 PM full buy check
   python buy_check.py --sl     → 10 AM / 1 PM SL-only check
 """
-import os, json, requests, sys
+import os, requests, sys
 from datetime import datetime
 from dotenv import load_dotenv
 import pytz
@@ -24,9 +29,9 @@ load_dotenv(r"C:\power15_bot\.env")
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-LOG_FILE         = r"C:\power15_bot\trade_log.json"
-CAP_FILE         = r"C:\power15_bot\paper_capital.json"
-WATCHLIST_FILE   = r"C:\power15_bot\watchlist.json"
+SUPA_URL         = os.environ.get("SUPABASE_URL", "https://xlrbmsmrgosqbioojqfz.supabase.co")
+SUPA_KEY         = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhscmJtc21yZ29zcWJpb29qcWZ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNTk2ODYsImV4cCI6MjA4ODczNTY4Nn0.FDMG6lKMXtMpESj3bEH1HbyTrJyPbn-Tn0WitMkLxiM")
+HDRS             = {"apikey": SUPA_KEY, "Authorization": f"Bearer {SUPA_KEY}"}
 IST              = pytz.timezone("Asia/Kolkata")
 SL_PCT           = 0.08
 
@@ -75,14 +80,44 @@ HYBRID_CONFIG = {
     "AUBANK":     {"threshold_pct": 80, "trail_pct":  0},
 }
 
+# ── Supabase helpers ────────────────────────────────────────────────────────
+def supa_get(table, query=""):
+    try:
+        r = requests.get(f"{SUPA_URL}/rest/v1/{table}?{query}", headers=HDRS, timeout=15)
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"  [Supabase] GET error: {e}")
+        return []
+
+def supa_post(table, data):
+    try:
+        h = {**HDRS, "Content-Type": "application/json", "Prefer": "return=minimal"}
+        r = requests.post(f"{SUPA_URL}/rest/v1/{table}", headers=h, json=data, timeout=15)
+        if r.status_code not in (200, 201):
+            print(f"  [Supabase] POST error [{table}]: {r.status_code} — {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"  [Supabase] POST error: {e}")
+        return False
+
+def supa_patch(table, query, data):
+    try:
+        h = {**HDRS, "Content-Type": "application/json", "Prefer": "return=minimal"}
+        r = requests.patch(f"{SUPA_URL}/rest/v1/{table}?{query}", headers=h, json=data, timeout=15)
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"  [Supabase] PATCH error: {e}")
+        return False
+
+def get_capital():
+    rows = supa_get("p15_capital", "select=*")
+    return rows[0] if rows else {
+        "initial":500000,"available":500000,"invested":0,
+        "total_pnl":0,"total_trades":0,"winning_trades":0
+    }
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def load_json(path, default):
-    if os.path.exists(path): return json.load(open(path))
-    return default
-
-def save_json(path, data):
-    json.dump(data, open(path, "w"), indent=2)
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -133,18 +168,13 @@ def get_cmp(symbol):
     except:
         return None
 
-def paper_buy(symbol, cmp, tier, avg_vol=None, vol_ratio=None):
-    trades  = load_json(LOG_FILE, [])
-    capital = load_json(CAP_FILE, {
-        "initial":500000,"available":500000,"invested":0,
-        "total_pnl":0,"total_trades":0,"winning_trades":0
-    })
-
-    open_syms = [t["symbol"] for t in trades if t["status"] == "OPEN"]
-    if symbol in open_syms:
+def paper_buy(symbol, cmp, tier):
+    trades = supa_get("p15_trades", "select=id,symbol,status")
+    if any(t["symbol"] == symbol and t["status"] == "OPEN" for t in trades):
         print(f"  [Paper] Already holding {symbol} — skipping")
         return False, "Already in portfolio"
 
+    capital     = get_capital()
     trade_value = TIER_TRADE_VALUE.get(tier, 10000)
     quantity    = max(1, int(trade_value / cmp))
     cost        = quantity * cmp
@@ -154,24 +184,27 @@ def paper_buy(symbol, cmp, tier, avg_vol=None, vol_ratio=None):
         print(f"  [Paper] Insufficient capital — need ₹{cost:.0f}, have ₹{capital['available']:.0f}")
         return False, "Insufficient capital"
 
+    new_id = max([t.get("id", 0) for t in trades], default=0) + 1
     trade = {
-        "symbol":      symbol,
-        "entry_date":  datetime.now(IST).strftime("%Y-%m-%d"),
-        "entry_price": round(cmp, 2),
-        "quantity":    quantity,
-        "sl_price":    sl_price,
-        "peak_cmp":    round(cmp, 2),
-        "status":      "OPEN",
-        "tier":        tier,
-        "sector":      POWER_15_SECTORS.get(symbol, "Other"),
-        "trade_value": trade_value,
-        "entry_vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
+        "id":           new_id,
+        "symbol":       symbol,
+        "entry_date":   datetime.now(IST).strftime("%Y-%m-%d"),
+        "entry_price":  round(cmp, 2),
+        "quantity":     quantity,
+        "sl_price":     sl_price,
+        "peak_cmp":     round(cmp, 2),
+        "cmp":          round(cmp, 2),
+        "status":       "OPEN",
+        "tier":         tier,
+        "sector":       POWER_15_SECTORS.get(symbol, "Other"),
     }
-    trades.append(trade)
-    capital["available"] -= cost
-    capital["invested"]  += cost
-    save_json(LOG_FILE, trades)
-    save_json(CAP_FILE, capital)
+    if not supa_post("p15_trades", trade):
+        return False, "Supabase insert failed"
+
+    supa_patch("p15_capital", "id=eq.1", {
+        "available": round(capital["available"] - cost, 2),
+        "invested":  round(capital["invested"] + cost, 2),
+    })
 
     print(f"  [Paper] ✅ BUY {symbol} @ ₹{cmp:.2f} x {quantity} qty = ₹{cost:.0f}  (Tier {tier}, alloc ₹{trade_value:,})")
     return True, "OK"
@@ -184,19 +217,13 @@ def intraday_sl_check(now):
     Does NOT process new buys.
     """
     print(f"\n[Intraday SL Check — {now.strftime('%H:%M IST')}]")
-    trades  = load_json(LOG_FILE, [])
-    capital = load_json(CAP_FILE, {
-        "initial":500000,"available":500000,"invested":0,
-        "total_pnl":0,"total_trades":0,"winning_trades":0
-    })
-
-    open_trades = [t for t in trades if t["status"] == "OPEN"]
+    open_trades = supa_get("p15_trades", "status=eq.OPEN&select=*")
     if not open_trades:
         print("  No open positions")
         return
 
-    alerts   = []
-    modified = False
+    capital = get_capital()
+    alerts  = []
 
     for t in open_trades:
         symbol = t["symbol"]
@@ -214,12 +241,13 @@ def intraday_sl_check(now):
             print(f"  ⚠️  Could not fetch {symbol}")
             continue
 
-        # Update peak
-        if cmp > t.get("peak_cmp", entry):
-            t["peak_cmp"] = round(cmp, 2)
-            modified = True
+        # Update peak + live price (feeds the GitHub Pages dashboard too)
+        peak_cmp    = t.get("peak_cmp") or entry
+        live_fields = {"cmp": round(cmp, 2), "cmp_updated_at": now.isoformat()}
+        if cmp > peak_cmp:
+            peak_cmp = cmp
+            live_fields["peak_cmp"] = round(cmp, 2)
 
-        peak_cmp  = t.get("peak_cmp", entry)
         pct       = (cmp - entry) / entry * 100
         cfg       = HYBRID_CONFIG.get(symbol, {"threshold_pct": 80, "trail_pct": 0})
         peak_pct  = (peak_cmp - entry) / entry * 100
@@ -243,27 +271,34 @@ def intraday_sl_check(now):
         if exit_reason:
             pnl     = (exit_price - entry) * t["quantity"]
             pnl_pct = (exit_price - entry) / entry * 100
-            t["status"]      = "CLOSED"
-            t["exit_date"]   = now.strftime("%Y-%m-%d")
-            t["exit_price"]  = round(exit_price, 2)
-            t["pnl"]         = round(pnl, 2)
-            t["pnl_pct"]     = round(pnl_pct, 2)
-            t["exit_reason"] = exit_reason
-            cost = entry * t["quantity"]
+            cost    = entry * t["quantity"]
+
+            supa_patch("p15_trades", f"id=eq.{t['id']}", {
+                "status":      "CLOSED",
+                "exit_date":   now.strftime("%Y-%m-%d"),
+                "exit_price":  round(exit_price, 2),
+                "cmp":         round(exit_price, 2),
+                "pnl":         round(pnl, 2),
+                "pnl_pct":     round(pnl_pct, 2),
+                "exit_reason": exit_reason,
+            })
             capital["available"]    += cost + pnl
             capital["invested"]     -= cost
             capital["total_pnl"]    += pnl
             capital["total_trades"] += 1
             if pnl > 0:
                 capital["winning_trades"] += 1
+            supa_patch("p15_capital", "id=eq.1", {
+                "available":      round(capital["available"], 2),
+                "invested":       round(capital["invested"], 2),
+                "total_pnl":      round(capital["total_pnl"], 2),
+                "total_trades":   capital["total_trades"],
+                "winning_trades": capital["winning_trades"],
+            })
             alerts.append({"symbol": symbol, "cmp": cmp, "pnl": pnl, "pct": pnl_pct, "reason": exit_reason})
-            modified = True
         else:
+            supa_patch("p15_trades", f"id=eq.{t['id']}", live_fields)
             print(f"  ✅ {symbol}: ₹{cmp:.2f} ({pct:+.1f}%) | SL ₹{sl:.2f} | Safe")
-
-    if modified:
-        save_json(LOG_FILE, trades)
-        save_json(CAP_FILE, capital)
 
     if alerts:
         msg = f"🚨 <b>Power 15 — Intraday Exit ({now.strftime('%H:%M IST')})</b>\n\n"
@@ -280,8 +315,9 @@ def intraday_sl_check(now):
 def full_buy_check(now):
     print(f"\n[Full Buy Check — {now.strftime('%H:%M IST')}]")
 
-    watchlist = load_json(WATCHLIST_FILE, {"date": "", "symbols": [], "nifty_status": "UNKNOWN"})
-    symbols   = watchlist.get("symbols", [])
+    wl_rows   = supa_get("p15_watchlist", "id=eq.1&select=*")
+    watchlist = wl_rows[0] if wl_rows else {}
+    symbols   = watchlist.get("symbols") or []
     nifty_st  = watchlist.get("nifty_status", "UNKNOWN")
 
     if not symbols:
@@ -347,7 +383,7 @@ def full_buy_check(now):
         })
 
     # Execute buys
-    msg  = f"⚡ <b>Power 15 Buy Check v2.0 — {now.strftime('%d %b %Y %H:%M')}</b>\n\n"
+    msg  = f"⚡ <b>Power 15 Buy Check v2.1 — {now.strftime('%d %b %Y %H:%M')}</b>\n\n"
     nifty_emoji = {"STRONG":"🟢","CAUTION":"🟡","AVOID":"🔴"}.get(nifty_st, "⚪")
     msg += f"{nifty_emoji} Nifty trend: <b>{nifty_st}</b>\n\n"
 
@@ -355,7 +391,7 @@ def full_buy_check(now):
         msg += f"🛒 <b>Buying {len(buy_list)} stock(s):</b>\n"
         for b in buy_list:
             tier_label = ["","🔥 T1","✅ T2","⚡ T3"][b["tier"]]
-            success, reason = paper_buy(b["symbol"], b["cmp"], b["tier"], vol_ratio=b["vol_ratio"])
+            success, reason = paper_buy(b["symbol"], b["cmp"], b["tier"])
             status = "✅ Bought" if success else f"❌ {reason}"
             msg += f"\n{tier_label} <b>{b['symbol']}</b>\n"
             msg += f"   Open: ₹{b['open']:.2f} → CMP: ₹{b['cmp']:.2f}{b['vol_tag']}\n"
@@ -372,26 +408,6 @@ def full_buy_check(now):
     print("\n[Telegram]")
     send_telegram(msg)
 
-    # Cloud sync
-    print("\n[Cloud Sync]")
-    try:
-        import subprocess, os
-        sync_path = r"C:\power15_bot\supabase_sync.py"
-        if not os.path.exists(sync_path):
-            sync_path = r"C:\power15_bot\Supabase_sync.py"
-        if os.path.exists(sync_path):
-            result = subprocess.run(
-                [r"C:\power15_bot\venv\Scripts\python.exe", sync_path],
-                capture_output=True, text=True, timeout=30
-            )
-            print(result.stdout.strip() or "  Cloud sync ✓")
-            if result.returncode != 0:
-                print(f"  Error: {result.stderr[:200]}")
-        else:
-            print("  supabase_sync.py not found — skipping")
-    except Exception as e:
-        print(f"  Cloud sync error: {e}")
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -402,7 +418,7 @@ def main():
     if mode:
         print(f"  ⚡ Power 15 Intraday SL Check")
     else:
-        print(f"  ⚡ Power 15 Buy Check v2.0")
+        print(f"  ⚡ Power 15 Buy Check v2.1")
     print(f"  {now.strftime('%d %b %Y %H:%M IST')}")
     print(f"{'='*55}")
 

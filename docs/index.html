@@ -139,6 +139,40 @@
     <div class="empty" id="maEmpty" style="display:none">No MA strategy trades today.</div>
   </section>
 
+  <section>
+    <h2>VCP Strategy — Open Positions</h2>
+    <div id="vcpCapital" class="stats" style="margin-bottom:14px"></div>
+    <div class="tbl-scroll">
+      <table id="vcpOpenTable">
+        <thead><tr><th>Symbol</th><th>Sector</th><th>Market</th><th>Entry</th><th>SL</th><th>T1</th><th>T2</th><th>Score</th><th>Stage</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="vcpOpenEmpty" style="display:none">No open VCP positions.</div>
+  </section>
+
+  <section>
+    <h2>VCP Strategy — Today's Signals</h2>
+    <div class="tbl-scroll">
+      <table id="vcpSignalsTable">
+        <thead><tr><th>Symbol</th><th>Stage</th><th>Score</th><th>CMP</th><th>Pivot</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="vcpSignalsEmpty" style="display:none">No signals today.</div>
+  </section>
+
+  <section>
+    <h2>VCP Strategy — Closed Trades <span class="note">(most recent 15)</span></h2>
+    <div class="tbl-scroll">
+      <table id="vcpClosedTable">
+        <thead><tr><th>Symbol</th><th>Entry Date</th><th>Exit Date</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>P&amp;L %</th><th>Reason</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="vcpClosedEmpty" style="display:none">No closed VCP trades yet.</div>
+  </section>
+
   <footer>
     Data refreshes from Supabase every 2 minutes · Prices sync once daily via the 4:00&nbsp;PM IST bot run
   </footer>
@@ -331,17 +365,94 @@ function renderMA(trades) {
   }).join("");
 }
 
+function renderVCPCapital(cap) {
+  const totalPnl = cap.total_pnl || 0;
+  const wr = cap.total_trades > 0 ? (cap.winning_trades / cap.total_trades * 100) : 0;
+  const tiles = [
+    ["Initial", fmtMoney(cap.initial)],
+    ["Available", fmtMoney(cap.available)],
+    ["Invested", fmtMoney(cap.invested)],
+    ["Total P&L", fmtMoney(totalPnl, true), totalPnl >= 0 ? "up" : "down"],
+    ["Win Rate", `${wr.toFixed(0)}%`, null, `${cap.winning_trades||0}/${cap.total_trades||0} trades`],
+  ];
+  document.getElementById("vcpCapital").innerHTML = tiles.map(([lbl,val,cls,sub]) => `
+    <div class="stat">
+      <div class="lbl">${lbl}</div>
+      <div class="val ${cls||''}">${val}</div>
+      ${sub ? `<div class="sub">${sub}</div>` : ''}
+    </div>`).join("");
+}
+
+function renderVCPOpen(trades) {
+  const tbody = document.querySelector("#vcpOpenTable tbody");
+  const empty = document.getElementById("vcpOpenEmpty");
+  if (!trades.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = trades.map(t => `
+    <tr>
+      <td class="sym">${t.symbol}</td>
+      <td>${t.sector||"—"}</td>
+      <td>${t.market||"—"}</td>
+      <td>₹${Number(t.entry_price).toFixed(2)}</td>
+      <td>₹${Number(t.sl_price).toFixed(2)}</td>
+      <td>₹${Number(t.target1).toFixed(2)}${t.t1_hit?' ✓':''}</td>
+      <td>₹${Number(t.target2).toFixed(2)}</td>
+      <td>${t.score}/${8}</td>
+      <td>${t.vcp_stage||"—"}</td>
+    </tr>`).join("");
+}
+
+function renderVCPSignals(signals) {
+  const tbody = document.querySelector("#vcpSignalsTable tbody");
+  const empty = document.getElementById("vcpSignalsEmpty");
+  if (!signals.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = signals.map(s => `
+    <tr>
+      <td class="sym">${s.symbol}</td>
+      <td>${s.stage}</td>
+      <td>${s.score}/${s.max_score||8}</td>
+      <td>₹${Number(s.cmp).toFixed(2)}</td>
+      <td>₹${Number(s.pivot).toFixed(2)}</td>
+    </tr>`).join("");
+}
+
+function renderVCPClosed(trades) {
+  const tbody = document.querySelector("#vcpClosedTable tbody");
+  const empty = document.getElementById("vcpClosedEmpty");
+  const sorted = [...trades].sort((a,b) => (b.exit_date||"").localeCompare(a.exit_date||"")).slice(0,15);
+  if (!sorted.length) { tbody.innerHTML=""; empty.style.display="block"; return; }
+  empty.style.display="none";
+  tbody.innerHTML = sorted.map(t => `
+    <tr>
+      <td class="sym">${t.symbol}</td>
+      <td>${t.entry_date||""}</td>
+      <td>${t.exit_date||""}</td>
+      <td>₹${Number(t.entry_price).toFixed(2)}</td>
+      <td>₹${Number(t.exit_price||0).toFixed(2)}</td>
+      <td class="${pctClass(t.pnl||0)}">${fmtMoney(t.pnl||0,true)}</td>
+      <td class="${pctClass(t.pnl_pct||0)}">${(t.pnl_pct||0)>=0?'+':''}${Number(t.pnl_pct||0).toFixed(1)}%</td>
+      <td style="white-space:normal;font-size:12px">${t.exit_reason||""}</td>
+    </tr>`).join("");
+}
+
 async function loadAll() {
-  const [trades, capRows, maTrades, maCapRows] = await Promise.all([
+  const [trades, capRows, maTrades, maCapRows, vcpTrades, vcpCapRows, vcpSignals] = await Promise.all([
     supa("p15_trades", "select=*"),
     supa("p15_capital", "select=*"),
     supa("ma_trades", `trade_date=eq.${new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Kolkata"})}&select=*`),
     supa("ma_capital", "select=*"),
+    supa("vcp_trades", "select=*"),
+    supa("vcp_capital", "select=*"),
+    supa("vcp_signals", `signal_date=eq.${new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Kolkata"})}&select=*`),
   ]);
   const cap = capRows[0] || { initial:500000, available:500000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
   const maCap = maCapRows[0] || { initial:100000, available:100000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
+  const vcpCap = vcpCapRows[0] || { initial:300000, available:300000, invested:0, total_pnl:0, total_trades:0, winning_trades:0 };
   const open = trades.filter(t => t.status === "OPEN");
   const closed = trades.filter(t => t.status === "CLOSED");
+  const vcpOpen = vcpTrades.filter(t => t.status === "OPEN");
+  const vcpClosed = vcpTrades.filter(t => t.status === "CLOSED");
 
   renderStats(cap, open);
   renderOpen(open);
@@ -350,6 +461,10 @@ async function loadAll() {
   renderEquityCurve(closed);
   renderMACapital(maCap);
   renderMA(maTrades);
+  renderVCPCapital(vcpCap);
+  renderVCPOpen(vcpOpen);
+  renderVCPSignals(vcpSignals);
+  renderVCPClosed(vcpClosed);
 
   const ms = marketState();
   document.getElementById("marketDot").style.background = ms.open ? "var(--good)" : "var(--critical)";

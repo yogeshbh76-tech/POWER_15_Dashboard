@@ -346,9 +346,14 @@ def detect_vcp(symbol, is_commodity=False):
     # Demand zone
     dz = find_demand_zone(candles)
 
-    # Target prices
-    t1 = round(pivot * (1 + T1_PCT), 2)
-    t2 = round(pivot * (1 + T2_PCT), 2)
+    # Target prices — anchored to the price actually paid.
+    # On a BREAKOUT, entry happens at cmp (already above pivot), so
+    # pivot-anchored targets could be satisfied the instant the position
+    # opens — closing it immediately for ~0% while reporting "Target hit".
+    # C3-FORMING hasn't traded yet, so the pivot is the anticipated entry.
+    anchor = cmp if stage == "BREAKOUT" else pivot
+    t1 = round(anchor * (1 + T1_PCT), 2)
+    t2 = round(anchor * (1 + T2_PCT), 2)
 
     return {
         "symbol":       symbol,
@@ -540,7 +545,8 @@ def monitor_open_trades():
         # 3. Target 2 — full exit
         elif cmp >= t2:
             exit_price  = cmp
-            exit_reason = f"Target 2 hit @ Rs{cmp:.2f} (+{T2_PCT*100:.0f}%)"
+            # report the gain actually realised, not the nominal target %
+            exit_reason = f"Target 2 hit @ Rs{cmp:.2f} ({pct:+.2f}%)"
 
         # 4. Max hold period
         elif hold_days >= MAX_HOLD_DAYS:
@@ -562,12 +568,13 @@ def monitor_open_trades():
         # 5. Target 1 hit — alert only (book 50% manually or log flag)
         if cmp >= t1 and not t.get("t1_hit"):
             supa_patch("vcp_trades", f"id=eq.{t['id']}", {"t1_hit": True})
+            trail_line = f"\nTrailing SL now active at Rs{trail_sl:.2f}" if trail_sl else ""
             tg(f"🎯 <b>VCP Strategy — Target 1 Hit!</b>\n\n"
                f"📌 <b>{sym}</b>\n"
                f"CMP: Rs{cmp:.2f} | T1: Rs{t1:.2f}\n"
                f"P&L so far: <b>{fi(pnl, True)} ({pct:+.2f}%)</b>\n"
-               f"Consider booking 50% here.\n"
-               f"Trailing SL now active at Rs{trail_sl:.2f}" if trail_sl else "")
+               f"Consider booking 50% here."
+               f"{trail_line}")
 
 # ── Save Signal to Supabase ────────────────────────────────────────────────────
 def save_signal(sig):
